@@ -1,8 +1,15 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { Trash2, RefreshCw, Folder, Activity, ChevronDown, X } from 'lucide-react';
-import { API_URL } from '../services/api';
+import { useState, useEffect, useRef } from 'react';
+import ConfirmDialog from './ConfirmDialog';
+import { useSavedStrategies } from '../context/SavedStrategiesContext';
+import { Trash2, Folder, ChevronDown, X } from 'lucide-react';
 import { deleteStrategy } from '../services/strategyApi';
 import logger from '../utils/logger';
+import { fetchStrategies as fetchStrategiesFromBackend } from '../services/libraryApi';
+
+const asDate = (value) => {
+  const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(value || '').trim());
+  return match ? `${match[3]}/${match[2]}/${match[1]}` : '';
+};
 
 const SavedStrategiesList = ({ onLoadStrategy, onNavigateToBuilder, onShowToast, onRefreshStrategies, refreshKey }) => {
   const [strategies, setStrategies] = useState([]);
@@ -15,26 +22,22 @@ const SavedStrategiesList = ({ onLoadStrategy, onNavigateToBuilder, onShowToast,
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [strategyToDelete, setStrategyToDelete] = useState(null);
 
+  const { strategies: contextStrategies, removeStrategy } = useSavedStrategies();
+
   const fetchStrategies = async () => {
     setLoading(true);
     setOpenDropdown(null);
     try {
-      const savedCards = JSON.parse(localStorage.getItem('saved_strategies_cards') || '[]');
-      
-      
-      savedCards.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-      
-      savedCards.forEach((s, idx) => {
-      });
-      
-      setStrategies(savedCards);
+      // GET /api/strategies — the signed-in user's own library, which is the
+      // only complete list: localStorage only ever held what this browser saw.
+      const rows = await fetchStrategiesFromBackend();
+      setStrategies(rows);
     } catch (error) {
-      logger.error('[SavedStrategiesList] Error loading strategies from localStorage:', error);
-      setStrategies([]);
-      
-      if (onShowToast) {
-        onShowToast(`Failed to load strategies: ${error.message}`, 'error');
-      }
+      logger.error('[SavedStrategiesList] Could not load strategies:', error);
+      setStrategies([...contextStrategies].sort(
+        (a, b) => new Date(b.created_at) - new Date(a.created_at),
+      ));
+      if (onShowToast) onShowToast(error.message, 'error');
     } finally {
       setLoading(false);
     }
@@ -43,7 +46,7 @@ const SavedStrategiesList = ({ onLoadStrategy, onNavigateToBuilder, onShowToast,
   useEffect(() => {
     fetchStrategies();
     setOpenDropdown(null);
-  }, [refreshKey]);
+  }, [refreshKey, contextStrategies]);
 
   useEffect(() => {
     const handleClickOutside = (event) => {
@@ -51,7 +54,6 @@ const SavedStrategiesList = ({ onLoadStrategy, onNavigateToBuilder, onShowToast,
         setOpenDropdown(null);
       }
     };
-
     document.addEventListener('mousedown', handleClickOutside);
     return () => {
       document.removeEventListener('mousedown', handleClickOutside);
@@ -67,7 +69,6 @@ const SavedStrategiesList = ({ onLoadStrategy, onNavigateToBuilder, onShowToast,
 
   const handleActivate = (strategy, mode) => {
     setOpenDropdown(null);
-    
     if (mode === 'paper') {
       setSelectedStrategy(strategy);
       setShowPaperTradeModal(true);
@@ -88,11 +89,9 @@ const SavedStrategiesList = ({ onLoadStrategy, onNavigateToBuilder, onShowToast,
   };
 
   const handleStrategyClick = async (strategy) => {
-    
     if (onLoadStrategy) {
       try {
         await onLoadStrategy(strategy.id, strategy.name);
-        
         if (onNavigateToBuilder) {
           onNavigateToBuilder();
         }
@@ -112,33 +111,22 @@ const SavedStrategiesList = ({ onLoadStrategy, onNavigateToBuilder, onShowToast,
 
   const confirmDelete = async () => {
     if (!strategyToDelete) return;
-
     const { id: strategyId, name: strategyName } = strategyToDelete;
-
     try {
-      
-      const savedCards = JSON.parse(localStorage.getItem('saved_strategies_cards') || '[]');
-      const updatedCards = savedCards.filter(card => card.id !== strategyId);
-      localStorage.setItem('saved_strategies_cards', JSON.stringify(updatedCards));
-      
-      
+      removeStrategy({ id: strategyId, name: strategyName });
       if (onShowToast) {
         onShowToast(`Strategy "${strategyName}" deleted successfully!`, 'success');
       }
-      
       fetchStrategies();
-      
       if (onRefreshStrategies) {
         onRefreshStrategies();
       }
-      
       try {
         await deleteStrategy(strategyId, strategyName);
       } catch (backendError) {
       }
     } catch (error) {
       logger.error('[SavedStrategiesList] Delete error:', error);
-      
       if (onShowToast) {
         onShowToast(`Failed to delete strategy: ${error.message}`, 'error');
       } else {
@@ -155,122 +143,125 @@ const SavedStrategiesList = ({ onLoadStrategy, onNavigateToBuilder, onShowToast,
     setStrategyToDelete(null);
   };
 
-  const getStrategyBadgeColor = (type) => {
-    const colors = {
-      'intraday': 'bg-orange-100 text-orange-700',
-      'btst': 'bg-purple-100 text-purple-700',
-      'sequential': 'bg-blue-100 text-blue-700',
-    };
-    return colors[type?.toLowerCase()] || 'bg-gray-100 text-gray-700';
-  };
+  const outlineBtn =
+    'px-4 py-2 rounded-md text-[13px] font-medium border bg-white text-[#2a2a2a] hover:bg-[#f5f5f5] transition-colors';
 
   return (
-    <div className="w-full h-full bg-gray-50">
-      <div className="mx-12">
-        {/* Header */}
-        <div className="flex items-center justify-between mb-8">
-          <div>
-            <h1 className="text-3xl font-bold text-gray-900 mb-2">Saved Strategies</h1>
-            <p className="text-gray-600">{strategies.length} strategies saved</p>
+    <div
+      className="w-full h-full"
+      style={{ fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" }}
+    >
+      <div className="mx-0">
+        {/* Header — section-style heading like the rest of the app */}
+        <div className="flex items-center justify-between mb-2.5">
+          <div className="flex items-baseline gap-3">
+            <h2 className="text-[20px] font-normal" style={{ color: '#3a3a3a' }}>Saved Strategies</h2>
+            <span className="text-[13px] text-gray-400">{strategies.length} saved</span>
           </div>
-          <button
-            onClick={fetchStrategies}
-            className="p-3 hover:bg-gray-200 rounded-lg transition-colors"
-            disabled={loading}
-            title="Refresh strategies"
-          >
-            <RefreshCw size={24} className={loading ? 'animate-spin text-blue-600' : 'text-gray-600'} />
-          </button>
+
         </div>
 
         {/* Content */}
         {loading ? (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
             {[1, 2, 3].map((i) => (
-              <div key={i} className="p-6 bg-white rounded-xl border border-gray-200 animate-pulse h-64" />
+              <div key={i} className="p-5 bg-white rounded-lg border border-[#f3f3f3] animate-pulse h-56" />
             ))}
           </div>
         ) : strategies.length === 0 ? (
-          <div className="flex flex-col items-center justify-center p-20 bg-white rounded-xl border border-gray-200">
-            <Folder size={80} className="text-gray-300 mb-6" />
-            <p className="text-2xl text-gray-500 mb-3 font-semibold">No saved strategies yet</p>
-            <p className="text-gray-400 text-lg">Build a strategy and save it to see it here</p>
+          <div className="flex flex-col items-center justify-center py-20 bg-white rounded-lg border border-[#f3f3f3]">
+            <Folder size={56} className="text-gray-300 mb-4" />
+            <p className="text-[15px] font-medium text-gray-600 mb-1">No saved strategies yet</p>
+            <p className="text-[13px] text-gray-400">Build a strategy and save it to see it here</p>
           </div>
         ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
             {strategies.map((strategy) => (
               <div
                 key={strategy.id}
-                className="bg-white rounded-lg border border-gray-300 hover:shadow-lg hover:border-blue-400 transition-all py-6 px-6"
+                className="bg-white rounded-lg border border-[#f3f3f3] hover:border-[#e3e3e3] transition-colors p-5"
               >
-                {/* Header Row - Strategy Type Badge */}
-                <div className="flex justify-end mb-4">
-                  <span className="px-3 py-1 rounded text-xs font-semibold text-orange-700 bg-orange-50">
-                    {strategy.strategy_type?.charAt(0).toUpperCase() + strategy.strategy_type?.slice(1) || 'Intraday'}
+                <div className="flex items-center justify-between gap-3 mb-3">
+                  <h2 className="text-[16px] font-semibold truncate" style={{ color: '#2a2a2a' }}>
+                    {strategy.name}
+                  </h2>
+                  {strategy.strategy_type ? (
+                  <span
+                    className="px-2.5 py-1 rounded text-[12px] font-medium shrink-0"
+                    style={{ backgroundColor: '#ECF6FF', color: '#0782DA' }}
+                  >
+                    {String(strategy.strategy_type).toUpperCase()}
                   </span>
+                  ) : null}
                 </div>
-
-                {/* Strategy Name */}
-                <h2 className="text-2xl font-bold text-blue-600 mb-2">
-                  {strategy.name}
-                </h2>
-                
-                {/* Subtitle */}
-                <p className="text-gray-600 text-sm mb-5">
-                  Option Structure | Paper-0x | Live-0x
-                </p>
 
                 {/* Symbol */}
-                <h3 className="text-lg font-bold text-gray-900 mb-2">
-                  {strategy.symbol || 'NIFTY'}
-                </h3>
-                
-                {/* Entry and Exit Time Row */}
-                <div className="flex justify-between text-sm mb-5">
-                  <div>
-                    <span className="text-gray-700">Entry time: </span>
-                    <span className="text-gray-900 font-semibold">{strategy.entry_time || '09:16'}</span>
-                  </div>
-                  <div className="text-right">
-                    <span className="text-gray-700">Exit time: </span>
-                    <span className="text-gray-900 font-semibold">{strategy.exit_time || '15:29'}</span>
-                  </div>
+                {strategy.symbol ? (
+                  <h3 className="text-[14px] font-medium mb-2 uppercase" style={{ color: '#3a3a3a' }}>
+                    {strategy.symbol}
+                  </h3>
+                ) : null}
+                <div className="flex justify-between text-[13px] mb-5 gap-3">
+                  {strategy.entry_time || strategy.exit_time ? (
+                    <>
+                      <div>
+                        <span className="text-gray-500">Entry time: </span>
+                        <span className="font-medium" style={{ color: '#2a2a2a' }}>{strategy.entry_time || '—'}</span>
+                      </div>
+                      <div className="text-right">
+                        <span className="text-gray-500">Exit time: </span>
+                        <span className="font-medium" style={{ color: '#2a2a2a' }}>{strategy.exit_time || '—'}</span>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div>
+                        <span className="text-gray-500">Start date: </span>
+                        <span className="font-medium" style={{ color: '#2a2a2a' }}>{asDate(strategy.start_date) || '—'}</span>
+                      </div>
+                      <div className="text-right">
+                        <span className="text-gray-500">End date: </span>
+                        <span className="font-medium" style={{ color: '#2a2a2a' }}>{asDate(strategy.end_date) || '—'}</span>
+                      </div>
+                    </>
+                  )}
                 </div>
 
-                {/* Action Buttons Row */}
+                {/* Actions */}
                 <div className="flex items-center gap-2 relative">
-                  <button 
+                  <button
                     onClick={() => handleStrategyClick(strategy)}
-                    className="px-5 py-2.5 rounded text-sm font-medium text-gray-700 bg-gray-200 hover:bg-gray-300 transition-colors z-0"
+                    className={outlineBtn}
+                    style={{ borderColor: '#e3e3e3' }}
                   >
                     Strategy
                   </button>
-                  <button className="px-5 py-2.5 rounded text-sm font-medium text-gray-700 bg-gray-200 hover:bg-gray-300 transition-colors z-0">
+                  <button className={outlineBtn} style={{ borderColor: '#e3e3e3' }}>
                     Execution
                   </button>
-                  
-                  {/* Activate Dropdown */}
+
+                  {/* Activate dropdown */}
                   <div className="relative z-10" ref={openDropdown === strategy.id ? dropdownRef : null}>
-                    <button 
+                    <button
                       onClick={() => toggleDropdown(strategy.id)}
-                      className="px-5 py-2.5 rounded text-sm font-medium text-white bg-blue-500 hover:bg-blue-600 transition-colors flex items-center gap-2"
+                      className="px-4 py-2 rounded-md text-[13px] font-medium text-white transition-colors flex items-center gap-1.5 hover:bg-[#0a5588]"
+                      style={{ backgroundColor: '#0B619B' }}
                     >
                       Activate
-                      <ChevronDown size={16} />
+                      <ChevronDown size={14} />
                     </button>
-                    
-                    {/* Dropdown Menu */}
+
                     {openDropdown === strategy.id && strategy.id !== null && strategy.id !== undefined && (
-                      <div className="absolute top-full left-0 mt-1 w-40 bg-white rounded shadow-lg border border-gray-200 z-50 overflow-hidden">
+                      <div className="absolute top-full left-0 mt-1 w-36 bg-white rounded-md shadow-lg border border-[#e3e3e3] z-50 overflow-hidden p-1">
                         <button
                           onClick={() => handleActivate(strategy, 'paper')}
-                          className="w-full px-4 py-2.5 text-left text-sm text-gray-700 hover:bg-gray-100 transition-colors"
+                          className="w-full px-3 py-2 text-left text-[13px] text-gray-700 hover:bg-[#f5f5f5] rounded transition-colors"
                         >
                           Paper Trade
                         </button>
                         <button
                           onClick={() => handleActivate(strategy, 'live')}
-                          className="w-full px-4 py-2.5 text-left text-sm text-gray-500 hover:bg-gray-100 transition-colors"
+                          className="w-full px-3 py-2 text-left text-[13px] text-gray-400 hover:bg-[#f5f5f5] rounded transition-colors"
                         >
                           Live Trade
                         </button>
@@ -283,10 +274,11 @@ const SavedStrategiesList = ({ onLoadStrategy, onNavigateToBuilder, onShowToast,
                       e.stopPropagation();
                       handleDelete(strategy.id, strategy.name);
                     }}
-                    className="p-2.5 rounded bg-blue-800 hover:bg-blue-900 transition-colors text-white ml-auto z-20 relative cursor-pointer"
+                    className="p-2 rounded-md border bg-white hover:bg-red-50 transition-colors ml-auto z-20 relative cursor-pointer"
+                    style={{ borderColor: '#e3e3e3', color: '#e0473c' }}
                     title="Delete strategy"
                   >
-                    <Trash2 size={18} />
+                    <Trash2 size={15} />
                   </button>
                 </div>
               </div>
@@ -297,60 +289,54 @@ const SavedStrategiesList = ({ onLoadStrategy, onNavigateToBuilder, onShowToast,
 
       {/* Paper Trade Modal */}
       {showPaperTradeModal && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-lg shadow-xl w-full max-w-md mx-4 relative">
-            {/* Close Button */}
-            <button
-              onClick={handleModalClose}
-              className="absolute top-4 right-4 text-gray-400 hover:text-gray-600 transition-colors"
-            >
-              <X size={24} />
-            </button>
-
-            {/* Modal Header */}
-            <div className="border-b border-gray-200 px-6 py-4">
-              <h2 className="text-xl font-semibold text-blue-500">
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg shadow-2xl w-full max-w-md mx-4">
+            <div className="flex items-center justify-between border-b border-gray-200 px-6 py-4">
+              <h2 className="text-[16px] font-semibold text-gray-800">
                 Paper-Trading Activation Settings
               </h2>
+              <button
+                onClick={handleModalClose}
+                className="text-gray-400 hover:text-gray-600 transition-colors"
+              >
+                <X size={18} />
+              </button>
             </div>
 
-            {/* Modal Body */}
             <div className="px-6 py-6">
-              {/* Instance Counter Display */}
-              <div className="flex justify-end mb-6">
-                <span className="text-gray-600 font-medium">
+              <div className="flex justify-end mb-5">
+                <span className="text-[13px] text-gray-500 font-medium">
                   {paperTradeInstances}/10
                 </span>
               </div>
 
-              {/* Table Header */}
-              <div className="grid grid-cols-2 gap-4 mb-4">
+              <div className="grid grid-cols-2 gap-4 mb-3">
                 <div className="text-center">
-                  <h3 className="text-sm font-semibold text-gray-700">Broker</h3>
+                  <h3 className="text-[13px] font-medium text-gray-700">Broker</h3>
                 </div>
                 <div className="text-center">
-                  <h3 className="text-sm font-semibold text-gray-700">No. of time</h3>
+                  <h3 className="text-[13px] font-medium text-gray-700">No. of time</h3>
                 </div>
               </div>
 
-              {/* Table Row */}
               <div className="grid grid-cols-2 gap-4 items-center mb-6">
                 <div className="flex items-center gap-3">
                   <input
                     type="checkbox"
                     id="paperTrade"
-                    className="w-5 h-5 rounded border-gray-300"
+                    className="w-4 h-4 rounded border-gray-300"
+                    style={{ accentColor: '#0B619B' }}
                     defaultChecked
                   />
-                  <label htmlFor="paperTrade" className="text-gray-700 font-medium">
+                  <label htmlFor="paperTrade" className="text-[13px] text-gray-700 font-medium">
                     Paper Trade
                   </label>
                 </div>
                 <div className="flex items-center justify-center">
-                  <div className="flex items-center border border-gray-300 rounded">
+                  <div className="flex items-center border rounded-md" style={{ borderColor: '#e3e3e3' }}>
                     <button
                       onClick={() => setPaperTradeInstances(Math.max(1, paperTradeInstances - 1))}
-                      className="px-3 py-1 hover:bg-gray-100 transition-colors"
+                      className="px-3 py-1 text-[14px] hover:bg-[#f5f5f5] transition-colors"
                     >
                       −
                     </button>
@@ -361,13 +347,14 @@ const SavedStrategiesList = ({ onLoadStrategy, onNavigateToBuilder, onShowToast,
                         const val = parseInt(e.target.value) || 1;
                         setPaperTradeInstances(Math.min(10, Math.max(1, val)));
                       }}
-                      className="w-16 text-center border-x border-gray-300 py-1 focus:outline-none"
+                      className="w-14 text-center border-x py-1 text-[13px] focus:outline-none"
+                      style={{ borderColor: '#e3e3e3' }}
                       min="1"
                       max="10"
                     />
                     <button
                       onClick={() => setPaperTradeInstances(Math.min(10, paperTradeInstances + 1))}
-                      className="px-3 py-1 hover:bg-gray-100 transition-colors"
+                      className="px-3 py-1 text-[14px] hover:bg-[#f5f5f5] transition-colors"
                     >
                       +
                     </button>
@@ -375,11 +362,11 @@ const SavedStrategiesList = ({ onLoadStrategy, onNavigateToBuilder, onShowToast,
                 </div>
               </div>
 
-              {/* Activate Button */}
               <div className="flex justify-end">
                 <button
                   onClick={handlePaperTradeActivate}
-                  className="px-8 py-2.5 bg-blue-400 hover:bg-blue-500 text-white rounded font-medium transition-colors"
+                  className="px-6 py-2 text-[13px] font-medium text-white rounded-md transition-colors"
+                  style={{ backgroundColor: '#0C4A6E' }}
                 >
                   Activate
                 </button>
@@ -389,47 +376,13 @@ const SavedStrategiesList = ({ onLoadStrategy, onNavigateToBuilder, onShowToast,
         </div>
       )}
 
-      {/* Delete Confirmation Modal */}
-      {showDeleteModal && strategyToDelete && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-lg shadow-xl w-full max-w-md mx-4 p-6">
-            {/* Warning Icon and Message */}
-            <div className="flex items-start gap-4 mb-6">
-              <div className="flex-shrink-0">
-                <div className="w-12 h-12 rounded-full bg-red-100 flex items-center justify-center">
-                  <svg className="w-6 h-6 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-                  </svg>
-                </div>
-              </div>
-              <div className="flex-1">
-                <h3 className="text-lg font-semibold text-gray-900 mb-2">
-                  Delete Strategy
-                </h3>
-                <p className="text-gray-600">
-                  Are you sure you want to delete <span className="font-semibold">"{strategyToDelete.name}"</span>? This action cannot be undone.
-                </p>
-              </div>
-            </div>
-
-            {/* Action Buttons */}
-            <div className="flex justify-end gap-3">
-              <button
-                onClick={cancelDelete}
-                className="px-6 py-2.5 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-lg font-medium transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={confirmDelete}
-                className="px-6 py-2.5 bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition-colors"
-              >
-                Delete
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <ConfirmDialog
+        isOpen={showDeleteModal && !!strategyToDelete}
+        title={`Are you sure you want to delete ${strategyToDelete?.name ?? ''} strategy?`}
+        message="You will not have access to this strategy anymore."
+        onConfirm={confirmDelete}
+        onCancel={cancelDelete}
+      />
     </div>
   );
 };

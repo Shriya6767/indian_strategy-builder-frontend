@@ -1,7 +1,9 @@
 import axios from "axios";
 import logger from '../utils/logger';
+import { attachAxiosLogger } from '../utils/apiLogger';
+import { attachAxiosAuth } from '../auth/authHeader';
 
-export const BASE_URL = "http://192.168.0.125:8000";
+export const BASE_URL = "";
 export const API_URL  = `${BASE_URL}/api`;
 
 const api = axios.create({
@@ -10,6 +12,12 @@ const api = axios.create({
     "Content-Type": "application/json",
   },
 });
+
+// Logs every axios request/response (with parameters) to the console.
+attachAxiosLogger(api);
+
+// Same bearer token the fetch wrapper adds — axios does not go through it.
+attachAxiosAuth(api);
 
 api.interceptors.request.use(
   (config) => config,
@@ -47,7 +55,7 @@ export const deletePortfolioAPI = async (portfolioId) => {
     
     return await response.json();
   } catch (error) {
-    logger.error('❌ Error deleting portfolio:', error);
+    logger.error('Error deleting portfolio:', error);
     throw error;
   }
 };

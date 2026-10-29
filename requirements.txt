@@ -1,0 +1,21 @@
+# Python dependencies for main.py — the bundled reference backend.
+#
+# NOT needed to run the frontend. The React app only needs `npm ci`.
+# Install these only if you want to work without the real backend:
+#
+#     python3 -m venv venv
+#     source venv/bin/activate
+#     pip install -r requirements.txt
+#     uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+#
+# Lower bounds, not exact pins: this is a throwaway stub with in-memory
+# storage, so a newer patch release is never a problem. The frontend is the
+# thing that needs reproducible versions, and package-lock.json handles that.
+
+fastapi>=0.110
+pydantic>=2.6
+uvicorn[standard]>=0.27
+
+# NOTE: main.py line 477 optionally imports `version_config_db` for PostgreSQL
+# persistence. That module is NOT in this repository and the import sits inside
+# a try/except, so the stub runs fine without it. No psycopg/SQLAlchemy needed.

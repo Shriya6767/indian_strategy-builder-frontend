@@ -1,3 +1,5 @@
+import { logError, logWarn } from './fileLog';
+
 const LOG_LEVELS = {
   ERROR: 'ERROR',
   SUCCESS: 'SUCCESS',
@@ -10,6 +12,9 @@ const LOG_LEVELS = {
 const logger = {
   error: (message, data = null) => {
     console.error(`[ERROR] ${message}`, data ? data : '');
+    // The message only -- `data` can hold a response body, which does not
+    // belong in a file. See src/utils/fileLog.js.
+    logError(message);
   },
 
   success: (message, data = null) => {
@@ -18,6 +23,7 @@ const logger = {
 
   warning: (message, data = null) => {
     console.warn(`[WARNING] ${message}`, data ? data : '');
+    logWarn(message);
   },
 
   request: (endpoint, requestDetails) => {
@@ -29,7 +35,8 @@ const logger = {
     }
     
     if (requestDetails.body) {
-      console.log('Request Body:', JSON.stringify(requestDetails.body, null, 2));
+      // Logged without a label so the JSON can be copied straight out of the console.
+      console.log(JSON.stringify(requestDetails.body, null, 2));
     }
   },
 

@@ -1,86 +1,64 @@
-import React, { useState } from 'react';
-import { LayoutDashboard, Settings, FileText, Activity, Key, ChevronRight, Save, Briefcase } from 'lucide-react';
+import { useState } from 'react';
+import { ChevronsLeft, ChevronRight, ChevronDown } from 'lucide-react';
+import SavedStrategiesTree from './SavedStrategiesTree';
 
-const Sidebar = ({ activeTab, setActiveTab, onToggleSidebar }) => {
-  const [isFullscreen, setIsFullscreen] = useState(false);
-
-  const handleToggleFullscreen = () => {
-    if (onToggleSidebar) {
-      onToggleSidebar();
-    }
-    setIsFullscreen(!isFullscreen);
-  };
-
-  const menuItems = [
-    { id: 'builder', label: 'Strategy Builder', icon: LayoutDashboard },
-    { id: 'live-dashboard', label: 'Live Trading', icon: Activity },
-    { id: 'save-strategy', label: 'Strategies', icon: Save },
-    { id: 'paper-trading', label: 'Paper Trading', icon: FileText },
-    { id: 'portfolios', label: 'Portfolios', icon: Briefcase },
-  ];
+const Sidebar = ({ onToggleSidebar, onCreateNewStrategy,
+  onOpenStrategy, onNotify, className = '' }) => {
+  // The tree is closed until asked for: it reads folders from storage and
+  // renders a row per strategy, which is work an unopened panel need not do.
+  const [treeOpen, setTreeOpen] = useState(false);
 
   return (
-    <div className="w-56 xl:w-64 shrink-0 bg-white border-r border-gray-200 flex flex-col">
-      <div className="p-6 border-b border-gray-200">
-        <h1 className="text-2xl font-bold" style={{ color: '#26619C' }}>Strategy Builder</h1>
-        <p className="text-sm text-gray-500 mt-1">Options Backtesting</p>
+    <div
+      className={`${className} w-[192px] shrink-0 min-h-0 bg-[#f5f5f5] border-r shadow-2xl flex flex-col relative z-10`}
+      style={{ borderColor: '#ececec', fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" }}
+    >
+      <button
+        onClick={onToggleSidebar}
+        className="absolute -right-3 top-9 w-7 h-7 rounded-full flex items-center justify-center z-20 text-gray-700 border transition-colors"
+        style={{ backgroundColor: '#F5F5F5', borderColor: '#E7E7E7' }}
+        onMouseEnter={(e) => {
+          e.currentTarget.style.backgroundColor = '#0B619B';
+          e.currentTarget.style.color = '#FFFFFF';
+          e.currentTarget.style.borderColor = '#0B619B';
+        }}
+        onMouseLeave={(e) => {
+          e.currentTarget.style.backgroundColor = '#F5F5F5';
+          e.currentTarget.style.color = '';
+          e.currentTarget.style.borderColor = '#E7E7E7';
+        }}
+        title="Collapse sidebar"
+      >
+        <ChevronsLeft size={14} />
+      </button>
+
+      <div className="border-b" style={{ borderColor: '#f3f3f3' }}>
+        <p className="px-4 pt-7 pb-2 text-[14px]" style={{ color: '#3a3a3a' }}>Saved Strategies</p>
+        <button
+          type="button"
+          onClick={() => setTreeOpen((was) => !was)}
+          aria-expanded={treeOpen}
+          className="w-full flex items-center gap-2 p-2.5 text-[14px] font-medium border-t transition-colors hover:bg-[#ececec] active:bg-[#e3e3e3]"
+          style={{ borderColor: '#f3f3f3', color: '#3a3a3a' }}
+        >
+          {treeOpen
+            ? <ChevronDown size={15} className="text-gray-500 shrink-0" />
+            : <ChevronRight size={15} className="text-gray-500 shrink-0" />}
+          <span>920Straddle</span>
+        </button>
       </div>
 
-      <nav className="flex-1 p-4">
-        {menuItems.map((item) => {
-          const Icon = item.icon;
-          const isActive = activeTab === item.id;
-
-          return (
-            <button
-              key={item.id}
-              onClick={() => setActiveTab(item.id)}
-              className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg mb-2 transition-all duration-200 hover:scale-[1.03] hover:shadow-md active:scale-[0.98] group ${
-                isActive
-                  ? 'font-medium shadow-sm'
-                  : 'text-gray-600 hover:bg-gray-50'
-              }`}
-              style={isActive ? {
-                backgroundColor: 'rgba(38, 97, 156, 0.1)',
-                color: '#26619C'
-              } : {}}
-            >
-              <Icon size={20} className="transition-transform duration-200 group-hover:scale-110" />
-              <span className="transition-transform duration-200 group-hover:translate-x-0.5">{item.label}</span>
-            </button>
-          );
-        })}
-
-        {/* Single Separator Icon - Fullscreen Toggle */}
-        <div className="flex justify-center my-4">
-          <button
-            onClick={handleToggleFullscreen}
-            className="text-white rounded-full p-2 flex items-center justify-center shadow-lg hover:shadow-xl hover:scale-110 active:scale-90 transition-all duration-200 cursor-pointer"
-            style={{ backgroundColor: '#26619C' }}
-            onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#1e4d7a'}
-            onMouseLeave={(e) => e.currentTarget.style.backgroundColor = '#26619C'}
-            title="Toggle Fullscreen"
-          >
-            <ChevronRight
-              size={20}
-              className={`text-white transition-transform duration-300 ${isFullscreen ? 'rotate-180' : 'rotate-0'}`}
-            />
-          </button>
+      {/* The scrolling region: the heading and 920Straddle above stay put. */}
+      {treeOpen ? (
+        <div className="flex-1 min-h-0 overflow-y-auto">
+        <SavedStrategiesTree
+          onOpenStrategy={onOpenStrategy}
+          onNewStrategy={onCreateNewStrategy}
+          onNotify={onNotify}
+        />
         </div>
-      </nav>
+      ) : null}
 
-      <div className="p-4 border-t border-gray-200">
-        <div className="text-xs text-gray-500">
-          <p>Connected to Backend</p>
-          <p className="text-green-500 mt-1 flex items-center gap-1.5">
-            <span className="relative flex h-2 w-2">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
-            </span>
-            Active
-          </p>
-        </div>
-      </div>
     </div>
   );
 };

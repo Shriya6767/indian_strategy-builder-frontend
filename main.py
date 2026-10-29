@@ -172,8 +172,8 @@ def simulate_trades(
     """
     trades = []
     lot_size   = legs[0]["lot_size"] if legs else 1
-    entry_time = strategy.get("entry_time", "13:30:00")
-    exit_time  = strategy.get("exit_time",  "20:00:00")
+    entry_time = strategy.get("entry_time", "09:16:00")
+    exit_time  = strategy.get("exit_time",  "15:40:00")
 
     # Use a simple but date-seeded P&L model so results vary realistically
     for idx, day in enumerate(trading_days):
@@ -238,14 +238,18 @@ def simulate_trades(
     return trades
 
 
-def compute_summary(trades: List[dict], initial_capital: float = 50000.0) -> dict:
-    """Compute real summary statistics from actual trade list."""
+def compute_summary(trades: List[dict]) -> dict:
+    """Compute real summary statistics from actual trade list.
+
+    Capital-free by design: there is no capital concept on the backend, so every
+    figure here is derived from the trade P&Ls alone.
+    """
     if not trades:
         return {
             "total_trades": 0, "winning_trades": 0, "losing_trades": 0,
             "win_rate": 0, "total_pnl": 0, "average_win": 0,
             "average_loss": 0, "profit_factor": 0, "max_drawdown": 0,
-            "sharpe_ratio": 0, "total_return": 0,
+            "sharpe_ratio": 0,
         }
 
     wins   = [t for t in trades if t["win"]]
@@ -257,9 +261,11 @@ def compute_summary(trades: List[dict], initial_capital: float = 50000.0) -> dic
     gross_win  = sum(t["pnl"] for t in wins)
     gross_loss = abs(sum(t["pnl"] for t in losses))
 
-    # Max drawdown — running equity curve
-    equity     = initial_capital
-    peak       = initial_capital
+    # Max drawdown — running equity curve. The curve starts at 0 rather than at
+    # a starting capital: drawdown is (equity - peak) and both terms shift by the
+    # same constant, so the starting value cancels out of every result.
+    equity     = 0.0
+    peak       = 0.0
     max_dd     = 0.0
     for t in trades:
         equity += t["pnl"]
@@ -287,7 +293,6 @@ def compute_summary(trades: List[dict], initial_capital: float = 50000.0) -> dic
         "profit_factor":   round(gross_win / gross_loss, 2) if gross_loss > 0 else 0,
         "max_drawdown":    round(max_dd, 2),
         "sharpe_ratio":    sharpe,
-        "total_return":    round(total_pnl / initial_capital * 100, 2),
     }
 
 
@@ -308,7 +313,7 @@ def compute_monthly_stats(trades: List[dict]) -> dict:
     return monthly
 
 
-def compute_cumulative_data(trades: List[dict], initial_capital: float = 50000.0) -> List[dict]:
+def compute_cumulative_data(trades: List[dict]) -> List[dict]:
     """Build cumulative P&L series from real trades."""
     cumulative = []
     running_pnl = 0.0
@@ -322,11 +327,15 @@ def compute_cumulative_data(trades: List[dict], initial_capital: float = 50000.0
     return cumulative
 
 
-def compute_drawdown_data(trades: List[dict], initial_capital: float = 50000.0) -> List[dict]:
-    """Build drawdown series from real trades."""
+def compute_drawdown_data(trades: List[dict]) -> List[dict]:
+    """Build drawdown series from real trades.
+
+    Same cancellation as compute_summary: the series is (equity - peak), so the
+    starting equity drops out and 0 gives byte-identical output.
+    """
     drawdown_series = []
-    equity = initial_capital
-    peak   = initial_capital
+    equity = 0.0
+    peak   = 0.0
     for t in trades:
         equity += t["pnl"]
         if equity > peak:

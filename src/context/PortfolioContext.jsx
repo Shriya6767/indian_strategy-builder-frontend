@@ -1,4 +1,5 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import { fetchPortfolios } from '../services/libraryApi';
 import { deletePortfolioAPI } from '../services/api';
 import logger from '../utils/logger';
 
@@ -14,6 +15,33 @@ export const usePortfolio = () => {
 
 export const PortfolioProvider = ({ children }) => {
   const [portfolios, setPortfolios] = useState([]);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [syncError, setSyncError] = useState(null);
+
+  /**
+   * GET /api/portfolios — the signed-in user's own list, which is the only
+   * complete one: localStorage holds what THIS browser happened to create.
+   * Called when the Portfolios screen opens rather than on mount, so signing in
+   * and never opening it costs nothing.
+   *
+   * A failure leaves the stored list alone: replacing it with nothing would
+   * read as "your portfolios are gone".
+   */
+  const refreshFromBackend = useCallback(async () => {
+    setIsSyncing(true);
+    setSyncError(null);
+    try {
+      const rows = await fetchPortfolios();
+      setPortfolios(rows.map((row) => ({ ...row.raw, portfolio_name: row.name, id: row.id })));
+      return null;
+    } catch (error) {
+      logger.error('[Portfolios] Could not load from the backend:', error);
+      setSyncError(error.message);
+      return error.message;
+    } finally {
+      setIsSyncing(false);
+    }
+  }, []);
   const [isLoaded, setIsLoaded] = useState(false);
 
   useEffect(() => {
@@ -24,7 +52,7 @@ export const PortfolioProvider = ({ children }) => {
         const parsed = JSON.parse(savedPortfolios);
         setPortfolios(parsed);
       } catch (error) {
-        logger.error('❌ Error loading portfolios from localStorage:', error);
+        logger.error('Error loading portfolios from localStorage:', error);
         setPortfolios([]);
       }
     } else {
@@ -112,9 +140,24 @@ export const PortfolioProvider = ({ children }) => {
       
       return { success: true };
     } catch (error) {
-      logger.error('❌ Failed to delete portfolio:', error);
+      logger.error('Failed to delete portfolio:', error);
       throw error;
     }
+  };
+
+  /**
+   * Drop a portfolio from local state WITHOUT calling the backend.
+   *
+   * For the caller that has already deleted it server-side — the portfolio
+   * detail page, which runs its own confirm and its own /delete-portfolio with
+   * the id resolved by name. It used to finish by calling deletePortfolio()
+   * below, which issued a SECOND identical POST for one user action.
+   *
+   * Use deletePortfolio() when nothing has contacted the backend yet (the
+   * portfolio list card); use this when something already has.
+   */
+  const removePortfolioLocal = (portfolioId) => {
+    setPortfolios(prev => prev.filter(p => p.portfolio_id !== portfolioId));
   };
 
   const getPortfolioById = (portfolioId) => {
@@ -131,8 +174,12 @@ export const PortfolioProvider = ({ children }) => {
     addPortfolio,
     updatePortfolio,
     deletePortfolio,
+    removePortfolioLocal,
     getPortfolioById,
     clearAllPortfolios,
+    refreshFromBackend,
+    isSyncing,
+    syncError,
     isLoaded // Expose whether data has been loaded from localStorage
   };
 

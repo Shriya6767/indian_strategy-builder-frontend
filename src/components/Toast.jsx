@@ -1,70 +1,58 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { CheckCircle, XCircle, AlertCircle, X } from 'lucide-react';
 
 /**
  * Toast notification component
  * Shows success, error, or info messages with auto-dismiss
  */
-const Toast = ({ message, type = 'success', onClose, duration = 3000 }) => {
-  useEffect(() => {
-    if (duration && duration > 0) {
-      const timer = setTimeout(() => {
-        onClose();
-      }, duration);
+const DEFAULT_DURATION = { success: 3000, info: 4000, error: 6000 };
 
-      return () => clearTimeout(timer);
-    }
-  }, [duration, onClose]);
+const Toast = ({ message, type = 'success', onClose, duration }) => {
+  const onCloseRef = useRef(onClose);
+  useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
+
+  const ms = duration ?? DEFAULT_DURATION[type] ?? DEFAULT_DURATION.success;
+
+  useEffect(() => {
+    if (!ms || ms <= 0) return undefined;
+    const timer = setTimeout(() => onCloseRef.current?.(), ms);
+    return () => clearTimeout(timer);
+    // A NEW message restarts the clock; a re-render does not.
+  }, [message, type, ms]);
 
   const getIcon = () => {
     switch (type) {
-      case 'success':
-        return <CheckCircle size={24} className="text-green-600" />;
       case 'error':
-        return <XCircle size={24} className="text-red-600" />;
+        return <XCircle size={20} className="shrink-0 mt-px" />;
       case 'info':
-        return <AlertCircle size={24} className="text-blue-600" />;
+        return <AlertCircle size={20} className="shrink-0 mt-px" />;
       default:
-        return <CheckCircle size={24} className="text-green-600" />;
+        return <CheckCircle size={20} className="shrink-0 mt-px" />;
     }
   };
 
   const getBackgroundColor = () => {
     switch (type) {
-      case 'success':
-        return 'bg-green-50 border-green-200';
       case 'error':
-        return 'bg-red-50 border-red-200';
+        return 'bg-red-600';
       case 'info':
-        return 'bg-blue-50 border-blue-200';
+        return 'bg-blue-600';
       default:
-        return 'bg-green-50 border-green-200';
-    }
-  };
-
-  const getTextColor = () => {
-    switch (type) {
-      case 'success':
-        return 'text-green-800';
-      case 'error':
-        return 'text-red-800';
-      case 'info':
-        return 'text-blue-800';
-      default:
-        return 'text-green-800';
+        return 'bg-green-600';
     }
   };
 
   return (
-    <div className="fixed top-4 right-4 z-50 animate-slide-in-right">
-      <div className={`flex items-center gap-3 px-6 py-4 rounded-lg border-2 shadow-lg ${getBackgroundColor()} min-w-[320px]`}>
+    <div className="fixed top-6 right-6 z-[200] animate-toast-in">
+      <div className={`flex items-start gap-3 pl-4 pr-3 py-3 rounded-lg shadow-lg text-white text-[14px] font-medium min-w-[280px] max-w-[440px] ${getBackgroundColor()}`}>
         {getIcon()}
-        <p className={`flex-1 font-semibold ${getTextColor()}`}>{message}</p>
+        <p className="flex-1 leading-snug">{message}</p>
         <button
           onClick={onClose}
-          className={`p-1 hover:bg-white rounded transition-colors ${getTextColor()}`}
+          className="shrink-0 -mt-0.5 -mr-1 p-1 rounded hover:bg-white/20 transition-colors"
+          title="Dismiss"
         >
-          <X size={18} />
+          <X size={16} />
         </button>
       </div>
     </div>

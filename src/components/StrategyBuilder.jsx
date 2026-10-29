@@ -1,21 +1,94 @@
-import { useState, useEffect, useRef, useCallback, memo } from 'react'; // Added memo for performance
-import { Plus, Trash2, Calendar, DollarSign, Info, Clock, ChevronRight, Settings, ChevronLeft, Copy, Save, Play, RefreshCw, X } from 'lucide-react';
+import { useState, useEffect, useRef, useCallback, useMemo, memo, Fragment } from 'react'; // Added memo for performance
+import { Info, Save, Play, ArrowRightLeft, X, CopyPlus } from 'lucide-react';
+import { readWindow, saveWindow } from '../utils/backtestWindow';
 import ToggleSwitch, { ToggleSwitchStyles } from './ToggleSwitch';
-import StrikeDropdown from './StrikeDropdown';
+import SegmentedGroup from './SegmentedGroup';
 import LegCard from './LegCard';
 import StrikeSelector from './StrikeSelector';
+import PlainDropdown from './PlainDropdown';
+import ReentryCountDropdown from './ReentryCountDropdown';
 import DateSegmentInput from './DateSegmentInput'; // Segmented DD/MM/YYYY with single-click selection
 import TimeSegmentInput from './TimeSegmentInput';
 import BacktestResults from './BacktestResults';
 import CompareBacktestSidebar from './CompareBacktestSidebar';
-import SaveStrategyModal from './SaveStrategyModal';
 import { API_URL } from '../services/api';
+import { DEFAULT_EXIT_TIME, SUPPORTED_INDEXES, DEFAULT_SYMBOL, DEFAULT_END_DATE } from '../config/constants';
+import {
+  MARKET_OPEN_TIME,
+  ENTRY_LAST_TIME,
+  EXIT_LAST_TIME,
+  timeRangeError,
+  timeOrderError,
+  isOvernightType,
+  entryExitError,
+  delayRestartError,
+  sessionWindowError,
+  TIME_WARNING_DELAY_MS,
+} from '../utils/timeRules';
+import { getDefaultConfig, getDefaultLeg } from '../config/defaultStrategyConfig';
 import { compareBacktests } from '../services/strategyApi';
 import { useStrategy } from '../context/StrategyContext';
 import logger from '../utils/logger';
+import { INSTRUMENT_SECTION_ID } from '../utils/revealSection';
+import { noLegsError, rangeBreakoutDteError } from '../utils/strategyValidation';
+import { colors } from '../theme/colors';
 
-  const StrategyBuilder = ({ onRunBacktest, isLoading, savedConfig, onConfigChange, onSaveStrategy, strategyId, onResetStrategyId, backtestResults, onClearResults, strategySavedInSession, saveCompletedCounter, backtestCompletedCounter, onLoadVersion }) => {
-  const { version: contextVersion } = useStrategy();
+const ROW_BLOCK = 'w-full max-w-[30rem] mx-auto';
+
+const selectChevron = (strokeColor) =>
+  `url("data:image/svg+xml;charset=UTF-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='${strokeColor}' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E")`;
+
+let legIdSequence = 0;
+const nextLegId = () => Date.now() * 1000 + (++legIdSequence % 1000);
+
+const SEQUENTIAL_LEG_DEFAULTS = Object.freeze({
+  customName: '',
+  lots: '1',
+  expiry: 'weekly',
+  position: 'buy',
+  option_type: 'call',
+  strike_criteria: 'based on points',
+  atm_strike: 'atm',
+  atm_percent_direction: '+',
+  atm_percent_value: '',
+  closest_premium_value: '',
+  lower_range: '',
+  upper_range: '',
+  premium_value: '',
+  target_enabled: false,
+  target_type: 'points',
+  target_value: '',
+  stop_loss_enabled: false,
+  stop_loss_type: 'points',
+  stop_loss_value: '',
+  trail_sl_enabled: false,
+  trail_sl_type: 'points',
+  trail_sl_value: '',
+  trail_sl_lock_value: '',
+  reentry_tgt_enabled: false,
+  reentry_tgt_mode: 're_asap',
+  reentry_tgt_count: '',
+  reentry_sl_enabled: false,
+  reentry_sl_mode: 're_asap',
+  reentry_sl_count: '',
+  momentum_enabled: false,
+  momentum_type: 'points',
+  momentum_value: '',
+});
+
+const ADVISORY_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const formatAdvisoryDate = (iso) => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso || ''));
+  if (!m) return '--';
+  const [, y, mo, d] = m;
+  return `${d}-${ADVISORY_MONTHS[Number(mo) - 1] || '---'}-${y.slice(2)}`;
+};
+
+const StrategyBuilder = ({ liveConfigRef, generation, onRunBacktest, isLoading, isLoadingStrategy = false, savedConfig, onConfigChange, onSaveStrategy, onSaveAsNew, strategyId, backtestResults, onClearResults, strategySavedInSession, saveCompletedCounter, backtestCompletedCounter, onLoadVersion, sidebarOpen = true,
+
+  readOnly = false }) => {
+  const { version: contextVersion, strategy_name: contextStrategyName } = useStrategy();
   
   const isLoadingConfigRef = useRef(false);
 
@@ -26,12 +99,16 @@ import logger from '../utils/logger';
   const endDateRef = useRef(null);
   const loadDataRef = useRef(null);
   
-  // Refs for Entry Settings navigation
+    // Refs for Entry Settings navigation
   const strategyTypeRef = useRef(null);
   const entryTimeRef = useRef(null);
   const exitTimeRef = useRef(null);
 
-  // Keyboard navigation handler for Data Selection
+  const [uiIndexPlaceholder, setUiIndexPlaceholder] = useState('SENSEX');
+  const [uiLegSegment, setUiLegSegment] = useState('options');
+  const [uiLegBuilderCollapsed, setUiLegBuilderCollapsed] = useState(false);
+
+
   const handleFieldNavigation = useCallback((e, currentField) => {
     const fieldOrder = [symbolRef, dteFilterRef, startDateRef, endDateRef, loadDataRef];
     const currentIndex = fieldOrder.indexOf(currentField);
@@ -45,7 +122,6 @@ import logger from '../utils/logger';
     }
   }, []);
   
-  // Keyboard navigation handler for Entry Settings
   const handleEntrySettingsNavigation = useCallback((e, currentField) => {
     const fieldOrder = [strategyTypeRef, entryTimeRef, exitTimeRef];
     const currentIndex = fieldOrder.indexOf(currentField);
@@ -59,104 +135,33 @@ import logger from '../utils/logger';
     }
   }, []);
 
-  const getDefaultConfig = () => {
-    return ({
-    symbol: 'SPXW',
-    start_month: '',
-    start_year: '',
-    end_month: '',
-    end_year: '',
-    start_date: '',
-    end_date: '',
-    dte_filter: '0',
-    instrument_index: 'SPXW',
-    underlying_from: 'cash',
-    underlying_type: 'cash',
-    square_off: 'partial',
-    is_squareoff: false,
-    trail_to_be: false,
-    trail_to_be_scope: 'all_legs', // 'all_legs' | 'sl_legs'
-    is_trail_sl_break_even: false,
-    trail_sl_break_even_type: 'na',
-    strategy_type: 'intraday',
-    sequential_position_type: 'BUY',
-    sequential_main_leg: 'CALL',
-    entry_time: '13:30',
-    exit_time: '20:00',
-    initial_capital: 50000,
-    lot_size: 1,
-    capital_mode: 'fixed', // 'fixed' or 'premium_based'
-    legs: [],
-    is_strategy_sl: false,
-    strategy_sl_type: 'points',
-    strategy_sl_value: 0,
-    is_strategy_target: false,
-    strategy_target_type: 'points',
-    strategy_target_value: 0,
-    overall_stop_loss_enabled: false,
-    overall_stop_loss_mode: 'mtm',
-    overall_stop_loss_value: '',  // Empty by default
-    overall_target_enabled: false,
-    overall_target_mode: 'mtm',
-    overall_target_value: '',  // Empty by default
-    lock_profit_enabled: false,
-    lock_profit_mode: 'points',  // Default to points
-    lock_profit_value: 0,
-    lock_profit_value1: '',  // First input field
-    lock_profit_value2: '',  // Second input field
-    lock_profit_lock_value: 1,
-    is_overall_reentry_sl: false,
-    overall_reentry_sl_enabled: false,
-    overall_reentry_sl_mode: 're_asap',
-    overall_reentry_sl_type: 're_asap',
-    overall_reentry_sl_count: '',  // Empty by default
-    overall_reentry_sl_value: 0,
-    overall_reentry_sl_cost_mode: 'same_capital',
-    overall_reentry_sl_multiplier: 2,
-    overall_reentry_sl_cost_value: 1.00,
-    is_overall_reentry_target: false,
-    overall_reentry_tgt_enabled: false,
-    overall_reentry_tgt_mode: 're_asap',
-    overall_reentry_target_type: 're_asap',
-    overall_reentry_tgt_count: '',  // Empty by default
-    overall_reentry_target_value: 0,
-    overall_reentry_tgt_cost_mode: 'profit_percentage',
-    overall_reentry_tgt_cost_value: 1.00,
-    is_overall_trail_sl: false,
-    overall_trail_sl_enabled: false,
-    overall_trail_sl_type: 'points',
-    overall_instrument_move: 0,
-    overall_stoploss_move: 0,
-    });
-  };
+
+  const mainLegPosition = (legs, parentLegId) =>
+    legs.filter(l => !l.isLazyLeg && !l.isSequentialLeg).findIndex(l => l.id === parentLegId) + 1;
 
   const createSequentialLeg = () => {
-    const parentIndex = sequentialLegParentIndex;
-    
-    const mainLegs = config.legs.filter(l => !l.isLazyLeg && !l.isSequentialLeg);
-    const parentMainLegPosition = mainLegs.findIndex((_, idx) => {
-      const mainLegIndex = config.legs.findIndex(l => l === mainLegs[idx]);
-      return mainLegIndex === parentIndex;
-    });
-    
-    const sequentialLegNumber = parentMainLegPosition + 1; // LEG#1 → SEQ#1, LEG#2 → SEQ#2
-    
-    const displayName = sequentialLegConfig.customName.trim() 
-      ? sequentialLegConfig.customName.trim() 
-      : `SEQ#${sequentialLegNumber}`;
-    
+    const parentLegId = sequentialLegParentId;
+    const parentIndex = config.legs.findIndex(l => l.id === parentLegId);
+    if (parentIndex === -1) return;
+
+    const sequentialLegNumber = mainLegPosition(config.legs, parentLegId);
+
+    const displayName = sequentialLegConfig.customName.trim()
+      ? sequentialLegConfig.customName.trim()
+      : `SEQ${sequentialLegNumber}`;
+
     const sequentialLeg = {
-      id: Date.now(),
+      id: nextLegId(),
       isSequentialLeg: true,  // Mark as sequential leg
       sequentialLegNumber: sequentialLegNumber,  // For display purposes
-      parentLegIndex: parentIndex,  // Store which main leg this belongs to
+      parentLegId,  // Stable parent reference — survives reordering/deletion
       customName: displayName,  // Store the custom or default name
-      
+
       lots: sequentialLegConfig.lots || '1',
-      expiry: sequentialLegConfig.expiry || '0dte',
+      expiry: sequentialLegConfig.expiry || 'weekly',
       position: sequentialLegConfig.position || 'buy',
       option_type: sequentialLegConfig.option_type || 'call',
-      
+
       strike_criteria: sequentialLegConfig.strike_criteria || 'based on points',
       strike_type: sequentialLegConfig.atm_strike || 'atm',
       atm_percent_direction: sequentialLegConfig.atm_percent_direction || '+',
@@ -164,111 +169,76 @@ import logger from '../utils/logger';
       closest_premium_value: sequentialLegConfig.closest_premium_value || '',
       lower_range: sequentialLegConfig.lower_range || '',
       upper_range: sequentialLegConfig.upper_range || '',
-      
+
       target_enabled: sequentialLegConfig.target_enabled || false,
-      target_type: sequentialLegConfig.target_type || 'points',
-      target_value: sequentialLegConfig.target_value || '0.00',
+      target_mode: sequentialLegConfig.target_type || 'points',
+      target_value: sequentialLegConfig.target_value || '',
       stop_loss_enabled: sequentialLegConfig.stop_loss_enabled || false,
-      stop_loss_type: sequentialLegConfig.stop_loss_type || 'points',
-      stop_loss_value: sequentialLegConfig.stop_loss_value || '0.00',
+      stop_loss_mode: sequentialLegConfig.stop_loss_type || 'points',
+      stop_loss_value: sequentialLegConfig.stop_loss_value || '',
       trail_enabled: sequentialLegConfig.trail_sl_enabled || false,
-      trail_type: sequentialLegConfig.trail_sl_type || 'points',
-      trail_value: sequentialLegConfig.trail_sl_value || '0.00',
-      trail_lock_value: sequentialLegConfig.trail_sl_lock_value || '0.00',
-      
+      trail_mode: sequentialLegConfig.trail_sl_type || 'points',
+      trail_value: sequentialLegConfig.trail_sl_value || '',
+      trail_lock_value: sequentialLegConfig.trail_sl_lock_value || '',
+
       reentry_tgt_enabled: sequentialLegConfig.reentry_tgt_enabled || false,
-      reentry_tgt_mode: sequentialLegConfig.reentry_tgt_mode || 're_cost',
-      reentry_tgt_count: sequentialLegConfig.reentry_tgt_count || '0',
+      reentry_tgt_mode: sequentialLegConfig.reentry_tgt_mode || 're_asap',
+      reentry_tgt_count: sequentialLegConfig.reentry_tgt_count || '1',
       reentry_sl_enabled: sequentialLegConfig.reentry_sl_enabled || false,
-      reentry_sl_mode: sequentialLegConfig.reentry_sl_mode || 're_cost',
-      reentry_sl_count: sequentialLegConfig.reentry_sl_count || '0',
-      
+      reentry_sl_mode: sequentialLegConfig.reentry_sl_mode || 're_asap',
+      reentry_sl_count: sequentialLegConfig.reentry_sl_count || '1',
+
       momentum_enabled: sequentialLegConfig.momentum_enabled || false,
-      momentum_mode: sequentialLegConfig.momentum_type || 'points_up',
+      momentum_mode: sequentialLegConfig.momentum_type || 'points',
       momentum_value: sequentialLegConfig.momentum_value || '',
-      
-      range_enabled: sequentialLegConfig.range_breakout_enabled || false,
-      range_instrument: sequentialLegConfig.range_instrument || 'underlying',
-      range_time: sequentialLegConfig.range_time || '14:45',
-      range_direction: sequentialLegConfig.range_direction || 'high',
-      
+
+      range_enabled: false,
+
       entry_time: config.entry_time,
       exit_time: config.exit_time,
-      
-      straddle_id: Date.now() % 10000
     };
-    
+
     const updatedLegs = [...config.legs];
     updatedLegs.splice(parentIndex + 1, 0, sequentialLeg);
-    
-    const newConfig = {
-      ...config,
-      legs: updatedLegs
-    };
-    setConfig(newConfig);
-    
+
+    setConfig({ ...config, legs: updatedLegs });
+    // Bring the newly created sequential leg into view, as Add / Copy / Create
+    // Lazy Leg do.
+    pendingScrollLegRef.current = sequentialLeg.id;
+
+    closeSequentialLegModal();
+  };
+
+  // Close + reset the draft. Used by Cancel, the X, and after a successful Create.
+  const closeSequentialLegModal = () => {
     setShowSequentialLegModal(false);
-    setSequentialLegParentIndex(null); // Reset parent index
-    setSequentialLegConfig({
-      customName: '',
-      lots: '1',
-      expiry: '0dte',
-      position: 'buy',
-      option_type: 'call',
-      strike_criteria: 'based on points',
-      atm_strike: 'atm',
-      atm_percent_direction: '+',
-      atm_percent_value: '',
-      closest_premium_value: '',
-      lower_range: '',
-      upper_range: '',
-      premium_value: '',
-      target_enabled: false,
-      target_type: 'points',
-      target_value: '',
-      stop_loss_enabled: false,
-      stop_loss_type: 'points',
-      stop_loss_value: '',
-      trail_sl_enabled: false,
-      trail_sl_type: 'points',
-      trail_sl_value: '',
-      trail_sl_lock_value: '',
-      reentry_tgt_enabled: false,
-      reentry_tgt_mode: 're_cost',
-      reentry_tgt_count: '',
-      reentry_sl_enabled: false,
-      reentry_sl_mode: 're_cost',
-      reentry_sl_count: '',
-      momentum_enabled: false,
-      momentum_type: 'points_up',
-      momentum_value: '',
-      range_breakout_enabled: false,
-      range_instrument: 'underlying',
-      range_time: '14:45',
-      range_direction: 'high'
-    });
+    setSequentialLegParentId(null);
+    setSequentialLegConfig(SEQUENTIAL_LEG_DEFAULTS);
   };
 
   const [config, setConfig] = useState(() => {
-    const initial = (savedConfig && Object.keys(savedConfig).length > 0) ? savedConfig : getDefaultConfig();
-    
+    const initial = (savedConfig && Object.keys(savedConfig).length > 0)
+      ? { ...getDefaultConfig(), ...savedConfig }
+      : getDefaultConfig();
+      
+    const stored = readWindow();
+    if (stored && !(savedConfig && Object.keys(savedConfig).length > 0)) {
+      if (stored.start_date) initial.start_date = stored.start_date;
+      // No end_date here on purpose -- it stays at DEFAULT_END_DATE, the date
+      // the data actually runs to. See backtestWindow.js for why remembering
+      // it made a fresh strategy open on whichever strategy was opened last.
+      if (stored.symbol) initial.dte_filter = stored.symbol;
+    }
+
     return initial;
   });
 
-  const [premiumBasedCapital, setPremiumBasedCapital] = useState(() => {
-    if (savedConfig && savedConfig.premiumBasedCapital) {
-      return savedConfig.premiumBasedCapital;
-    }
-    return null;
-  });
-  const [fetchingPremiums, setFetchingPremiums] = useState(false);
-  
   const [showLazyLegModal, setShowLazyLegModal] = useState(false);
-  const [lazyLegContext, setLazyLegContext] = useState(null); // { legIndex, type: 'target' | 'sl' }
+  const [lazyLegContext, setLazyLegContext] = useState(null); 
   const [lazyLegConfig, setLazyLegConfig] = useState({
     customName: '',  // NEW: Custom name for lazy leg
     lots: 1,
-    expiry: '0dte',
+    expiry: 'weekly',
     position: 'buy',
     option_type: 'call',
     strike_criteria: 'based on points',
@@ -279,71 +249,74 @@ import logger from '../utils/logger';
     lower_range: '',
     upper_range: '',
     premium_value: '',
-    target_enabled: false,      // Default OFF but fields visible
+    target_enabled: false,      
     target_type: 'points',
     target_value: '0.00',
-    stop_loss_enabled: false,   // Default OFF but fields visible
+    stop_loss_enabled: false,   
     stop_loss_type: 'points', 
     stop_loss_value: '0.00',
-    trail_sl_enabled: false,    // Default OFF but fields visible
+    trail_sl_enabled: false,    
     trail_sl_type: 'points',
     trail_sl_value: '0.00',
-    trail_sl_lock_value: '0.00',  // Added second Trail SL input
-    reentry_tgt_enabled: false, // Default OFF but fields visible
-    reentry_tgt_mode: 're_cost',
-    reentry_tgt_count: '1.00',
-    reentry_sl_enabled: false,  // Default OFF but fields visible
-    reentry_sl_mode: 're_cost',
-    reentry_sl_count: '1.00',
-    momentum_enabled: false,    // Default OFF but fields visible
-    momentum_type: 'points_up',
+    trail_sl_lock_value: '0.00',  
+    reentry_tgt_enabled: false, 
+    reentry_tgt_mode: 're_asap',
+    reentry_tgt_count: '1',
+    reentry_sl_enabled: false,  
+    reentry_sl_mode: 're_asap',
+    reentry_sl_count: '1',
+    momentum_enabled: false,   
+    momentum_type: 'points',
     momentum_value: '0.00',
-    range_breakout_enabled: false, // Default OFF but fields visible
+    range_breakout_enabled: false, 
     range_instrument: 'underlying',
-    range_time: '14.45',
+    range_time: '',
     range_direction: 'high'
   });
   
+  // Leg to scroll into view once the next render commits (add / copy / delete).
+  // A ref rather than state: it's consumed by an effect that must not re-render.
+  const pendingScrollLegRef = useRef(null);
+
   const [showSequentialLegModal, setShowSequentialLegModal] = useState(false);
-  const [sequentialLegParentIndex, setSequentialLegParentIndex] = useState(null); // Track which leg is creating the sequential leg
-  const [sequentialLegConfig, setSequentialLegConfig] = useState({
-    customName: '',  // Custom name for sequential leg
-    lots: '1',
-    expiry: '0dte',
-    position: 'buy',
-    option_type: 'call',
-    strike_criteria: 'based on points',
-    atm_strike: 'atm',
-    atm_percent_direction: '+',
-    atm_percent_value: '',
-    closest_premium_value: '',
-    lower_range: '',
-    upper_range: '',
-    premium_value: '',
-    target_enabled: false,
-    target_type: 'points',
-    target_value: '',
-    stop_loss_enabled: false,
-    stop_loss_type: 'points',
-    stop_loss_value: '',
-    trail_sl_enabled: false,
-    trail_sl_type: 'points',
-    trail_sl_value: '',
-    trail_sl_lock_value: '',
-    reentry_tgt_enabled: false,
-    reentry_tgt_mode: 're_cost',
-    reentry_tgt_count: '',
-    reentry_sl_enabled: false,
-    reentry_sl_mode: 're_cost',
-    reentry_sl_count: '',
-    momentum_enabled: false,
-    momentum_type: 'points_up',
-    momentum_value: '',
-    range_breakout_enabled: false,
-    range_instrument: 'underlying',
-    range_time: '14:45',
-    range_direction: 'high'
-  });
+  const [sequentialLegParentId, setSequentialLegParentId] = useState(null); // Which main leg is creating the sequential leg
+  const [sequentialLegConfig, setSequentialLegConfig] = useState(SEQUENTIAL_LEG_DEFAULTS);
+
+  // ── Lazy / Sequential leg modal dependency rules ────────────────────────
+  // Same contract LegCard applies to the main leg section: Trail SL and
+  // Re-entry on SL build on Stop Loss, Re-entry on Tgt builds on Target, and
+  // none is meaningful until its parent is ON *and* carries a value. Kept here
+  // (rather than duplicated per modal) so both popups enforce one rule set.
+  const requireParentField = (enabled, value, fieldLabel) => {
+    if (!enabled) {
+      setResponsePopup({ type: 'error', title: `Please enable the ${fieldLabel} first.` });
+      return false;
+    }
+    if (value === '' || value === null || value === undefined) {
+      setResponsePopup({ type: 'error', title: `Please enter a value for ${fieldLabel}.` });
+      return false;
+    }
+    return true;
+  };
+  const modalStopLossReady = (cfg) => requireParentField(cfg.stop_loss_enabled, cfg.stop_loss_value, 'Stop Loss');
+  const modalTargetReady = (cfg) => requireParentField(cfg.target_enabled, cfg.target_value, 'Target');
+
+  // Switching a parent OFF switches its dependents off too, so a dependent
+  // toggle can never be left on with nothing behind it.
+  const modalTargetToggle = (setCfg) => (e) => {
+    if (!e.target.checked) {
+      setCfg(prev => ({ ...prev, target_enabled: false, reentry_tgt_enabled: false }));
+      return;
+    }
+    setCfg(prev => ({ ...prev, target_enabled: true }));
+  };
+  const modalStopLossToggle = (setCfg) => (e) => {
+    if (!e.target.checked) {
+      setCfg(prev => ({ ...prev, stop_loss_enabled: false, trail_sl_enabled: false, reentry_sl_enabled: false }));
+      return;
+    }
+    setCfg(prev => ({ ...prev, stop_loss_enabled: true }));
+  };
   
   // (entryTimeRef / exitTimeRef removed -- no longer needed now that Entry
   // and Exit Time use the segmented TimeSegmentInput component, which
@@ -420,6 +393,18 @@ import logger from '../utils/logger';
     return () => clearTimeout(t);
   }, [responsePopup]);
 
+  // Bring the leg just added, copied, or left behind by a delete into view.
+  // Runs after the legs render, so the target node already exists. Clearing a
+  // ref (rather than state) keeps this from triggering another render.
+  useEffect(() => {
+    const legId = pendingScrollLegRef.current;
+    if (legId == null) return;
+    pendingScrollLegRef.current = null;
+    document
+      .getElementById(`leg-card-${legId}`)
+      ?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, [config.legs]);
+
   const [userMadeChanges, setUserMadeChanges] = useState(false);
   
   const [isSaveButtonEnabled, setIsSaveButtonEnabled] = useState(false);
@@ -441,7 +426,7 @@ import logger from '../utils/logger';
       const configToCompare = JSON.parse(JSON.stringify(config));
       const originalToCompare = JSON.parse(JSON.stringify(originalConfig));
       
-      const fieldsToIgnore = ['currentLeg', 'premiumBasedCapital', 'dataLoaded'];
+      const fieldsToIgnore = ['currentLeg', 'dataLoaded'];
       fieldsToIgnore.forEach(field => {
         delete configToCompare[field];
         delete originalToCompare[field];
@@ -464,62 +449,9 @@ import logger from '../utils/logger';
     }
     const strategyType = (savedConfig && savedConfig.strategy_type) || 'intraday';
     const dteFilter = (savedConfig && savedConfig.dte_filter) || '0';
-    const defaultExpiry = (dteFilter === 'combined' || dteFilter === 'combine_dte') ? '1dte' : (dteFilter === '0' ? '0dte' : '1dte');
+    const defaultExpiry = 'weekly';
     
-    return {
-      segment: 'options',
-      lots: '1',  // ? Default value is 1
-      position: 'buy',
-      option_type: 'call',
-      expiry: defaultExpiry,  // Set based on DTE filter
-      strike_criteria: 'based on points',
-      strike_type: 'atm',
-      strike_value: '',  // ? EMPTY by default
-      premium_tolerance: '',  // ? EMPTY by default
-      atm_percent_direction: '+',  // ? Default to '+'
-      atm_percent_value: '',  // ? EMPTY by default
-      lower_range: '',  // ? EMPTY by default
-      upper_range: '',  // ? EMPTY by default
-      closest_premium_value: '',  // ? EMPTY by default
-      entry_time: '',  // Empty = use global time
-      exit_time: '',   // Empty = use global time
-      target_enabled: false,  // ? OFF by default
-      target_mode: 'points',
-      target_value: '',  // ? EMPTY by default
-      stop_loss_enabled: false,  // ? OFF by default
-      stop_loss_mode: 'points',
-      stop_loss_value: '',  // ? EMPTY by default
-      trail_enabled: false,
-      trail_mode: 'points',
-      trail_value: '',
-      momentum_enabled: false,  // ? OFF by default
-      momentum_mode: 'percent_up',
-      momentum_value: '',  // ? EMPTY by default
-      range_enabled: false,
-      range_instrument: 'underlying',
-      range_time: '14:45',
-      reentry_tgt_enabled: false,
-      reentry_tgt_mode: 're_cost',
-      reentry_tgt_count: '',  // ? EMPTY by default
-      reentry_sl_enabled: false,
-      reentry_sl_mode: 're_cost',
-      reentry_sl_count: '',  // ? EMPTY by default
-      trail_lock_value: '',
-      range_breadth_enabled: false,
-      range_breadth_comparison: 'gte',
-      range_breadth_value: '',
-      open_low_enabled: false,
-      open_low_mode: 'points',
-      open_low_value: '',
-      open_high_enabled: false,
-      open_high_mode: 'points',
-      open_high_value: '',
-      gap_filter_enabled: false,
-      gap_filter_instrument: 'instrument',
-      gap_filter_direction: 'gap_up',
-      gap_filter_comparison: 'gte',
-      gap_filter_value: '',
-    };
+    return getDefaultLeg();
   });
 
   const [tempHour, setTempHour] = useState('09');
@@ -546,54 +478,82 @@ import logger from '../utils/logger';
     setTimePickerOpen(false);
   };
 
-  // Commits a complete "HH:MM" value coming from the segmented time input
-  // for Entry/Exit Time. Preserves the exact same cross-field rule as
-  // before (Entry must be before Exit) -- only the interaction model
-  // (segmented click/type/arrow-key editing vs. free-text typing) changed.
-  // Returns true if the value was accepted, false if rejected (the
-  // TimeSegmentInput component reverts its own display when rejected).
+  const timeWarningTimerRef = useRef(null);
+  const warnAboutTimeLater = (message) => {
+    if (timeWarningTimerRef.current) clearTimeout(timeWarningTimerRef.current);
+    timeWarningTimerRef.current = null;
+    if (!message) return;
+    timeWarningTimerRef.current = setTimeout(() => {
+      timeWarningTimerRef.current = null;
+      setResponsePopup({ type: 'error', title: message });
+    }, TIME_WARNING_DELAY_MS);
+  };
+  useEffect(() => () => clearTimeout(timeWarningTimerRef.current), []);
+
+  // Positional: the exit must not be FURTHER from expiry than the entry, i.e.
+  // exit days <= entry days. Returns the message, or null when the pair is fine.
+  const positionalDayError = (entryDay, exitDay) => {
+    if ((config.strategy_type || 'intraday') !== 'positional') return null;
+    const entry = Number(entryDay);
+    const exit = Number(exitDay);
+    if (Number.isNaN(entry) || Number.isNaN(exit)) return null;
+    return exit > entry
+      ? 'Exit days to expiry cannot be greater than the entry days'
+      : null;
+  };
+
+  // Positional on a MONTHLY basis counts trading days back from a monthly
+  // expiry, so a leg that trades a weekly contract has no place in it — the leg
+  // would expire before the strategy's own expiry. Same rule AlgoTest enforces.
+  // Takes the leg list so a pending edit can be checked before it is committed.
+  const POSITIONAL_WEEKLY_LEG_ERROR = 'Cannot enter on monthly expiry basis with a weekly leg';
+  const positionalExpiryError = (legs = config.legs, expiry = config.positional_expiry) => {
+    if ((config.strategy_type || 'intraday') !== 'positional') return null;
+    if ((expiry || 'weekly') !== 'monthly') return null;
+    const hasWeeklyLeg = (legs || []).some(
+      (l) => l.expiry === 'weekly' || l.expiry === 'next_weekly'
+    );
+    return hasWeeklyLeg ? POSITIONAL_WEEKLY_LEG_ERROR : null;
+  };
+
+  // Same warning for a single expiry value, used by the Lazy Leg and Sequential
+  // Leg modals where the leg does not exist in config.legs yet.
+  const warnIfWeeklyLegExpiry = (expiry) => {
+    if ((config.strategy_type || 'intraday') !== 'positional') return;
+    if ((config.positional_expiry || 'weekly') !== 'monthly') return;
+    if (expiry !== 'weekly' && expiry !== 'next_weekly') return;
+    setResponsePopup({ type: 'error', title: POSITIONAL_WEEKLY_LEG_ERROR });
+  };
+
+  // "trading days before expiry" choices: a weekly expiry is at most 4 trading
+  // days out, a monthly one up to 24. Rebuilt only when the basis changes.
+  const positionalDayOptions = useMemo(
+    () => Array.from(
+      { length: (config.positional_expiry || 'weekly') === 'monthly' ? 25 : 5 },
+      (_, i) => String(i)
+    ),
+    [config.positional_expiry]
+  );
+
   const commitTime = (field, formatted) => {
-    const [h, m] = formatted.split(':').map(Number);
-    const timeInMinutes = h * 60 + m;
+    const entry = field === 'entry_time' ? formatted : config.entry_time;
+    const exit = field === 'exit_time' ? formatted : config.exit_time;
 
-    // Validate time range: must be between 13:30 (810 minutes) and 21:00 (1260 minutes)
-    const minTime = 13 * 60 + 30; // 13:30 = 810 minutes
-    const maxTime = 21 * 60; // 21:00 = 1260 minutes
+    const error =
+      timeRangeError(field, formatted) ||
+      timeOrderError(config.strategy_type, entry, exit);
 
-    if (timeInMinutes < minTime || timeInMinutes > maxTime) {
-      setResponsePopup({ 
-        type: 'error', 
-        title: 'Invalid Time Range', 
-        message: 'Please select a time between 13:30 and 21:00' 
-      });
-      return false;
-    }
+    warnAboutTimeLater(error);
+    if (!error) lastValidTimeRef.current[field] = formatted;
 
-    const otherField = field === 'entry_time' ? 'exit_time' : 'entry_time';
-    const otherValue = config[otherField];
-    if (otherValue && otherValue.length === 5 && otherValue.includes(':')) {
-      const [oh, om] = otherValue.split(':').map(Number);
-      const otherInMinutes = oh * 60 + om;
-
-      if (field === 'entry_time' && timeInMinutes >= otherInMinutes) {
-        setResponsePopup({ type: 'error', title: 'Entry Time must be before Exit Time' });
-        return false;
-      }
-      if (field === 'exit_time' && timeInMinutes <= otherInMinutes) {
-        setResponsePopup({ type: 'error', title: 'Exit Time must be after Entry Time' });
-        return false;
-      }
-    }
-
-    lastValidTimeRef.current[field] = formatted;
     handleChange(field, formatted);
     return true;
   };
 
   useEffect(() => {
     if (savedConfig && Object.keys(savedConfig).length > 0) {
-      const currentConfigJson = JSON.stringify({...config, currentLeg: undefined, premiumBasedCapital: undefined, dataLoaded: undefined});
-      const savedConfigJson = JSON.stringify({...savedConfig, currentLeg: undefined, premiumBasedCapital: undefined, dataLoaded: undefined});
+      const currentConfigJson = JSON.stringify({...config, currentLeg: undefined, dataLoaded: undefined});
+      const savedConfigJson = JSON.stringify({...savedConfig, currentLeg: undefined, dataLoaded: undefined});
       
       if (currentConfigJson === savedConfigJson && strategyId) {
         return;
@@ -628,8 +588,8 @@ import logger from '../utils/logger';
           mergedConfig.legs = mergedConfig.legs.map(leg => ({
             ...leg,
             strike_criteria: leg.strike_criteria,
-            entry_time: leg.entry_time || mergedConfig.entry_time || '13:30',
-            exit_time: leg.exit_time || mergedConfig.exit_time || '20:00',
+            entry_time: leg.entry_time || mergedConfig.entry_time || '09:16',
+            exit_time: leg.exit_time || mergedConfig.exit_time || DEFAULT_EXIT_TIME,
             atm_percent_direction: leg.atm_percent_direction !== undefined ? leg.atm_percent_direction : '+',
             atm_percent_value: leg.atm_percent_value !== undefined ? leg.atm_percent_value : '',
             lower_range: leg.lower_range !== undefined ? leg.lower_range : '',
@@ -639,9 +599,6 @@ import logger from '../utils/logger';
       }
       
       setConfig(mergedConfig);
-      // Keep the last-valid-time reference in sync with whatever strategy
-      // was just loaded, so clearing a field later reverts to THIS
-      // strategy's time, not a stale default from before.
       lastValidTimeRef.current = {
         entry_time: mergedConfig.entry_time,
         exit_time: mergedConfig.exit_time,
@@ -657,14 +614,9 @@ import logger from '../utils/logger';
         setDataLoaded(savedConfig.dataLoaded);
         setDataStatus(savedConfig.dataLoaded ? "Data loaded ?" : "Click 'Load Data' to begin");
       }
-      
-      if (savedConfig.premiumBasedCapital) {
-        setPremiumBasedCapital(savedConfig.premiumBasedCapital);
-      }
-      
-      requestAnimationFrame(() => {
+      setTimeout(() => {
         isLoadingConfigRef.current = false;
-      });
+      }, 0);
     }
   }, [savedConfig]);
 
@@ -677,20 +629,17 @@ import logger from '../utils/logger';
   const latestConfigWithExtrasRef = useRef(null);
 
   useEffect(() => {
-    if (onConfigChange && !isLoadingConfigRef.current) {
-      const configWithExtras = { 
-        ...config, 
-        currentLeg,
-        premiumBasedCapital,  // ? Persist premium calculation
-        dataLoaded  // ? NEW: Persist data loaded state
-      };
-      latestConfigWithExtrasRef.current = configWithExtras;
+    const configWithExtras = {
+      ...config,
+      currentLeg,
+      dataLoaded  // ? NEW: Persist data loaded state
+    };
+    latestConfigWithExtrasRef.current = configWithExtras;
+    saveWindow(config);
+    if (liveConfigRef) liveConfigRef.current = configWithExtras;
 
-      // setUserMadeChanges stays IMMEDIATE (cheap boolean state set) so the
-      // Save button reacts instantly. Only the expensive push to the parent
-      // App.jsx (onConfigChange), which re-renders the whole app shell, is
-      // debounced -- it now fires once ~200ms after the user pauses, instead
-      // of on every single keystroke while typing (e.g. in Entry/Exit Time).
+    if (onConfigChange && !isLoadingConfigRef.current) {
+
       if (strategyId && strategyId !== -999 && strategyId !== '-999' && originalConfig) {
         setUserMadeChanges(true);
       }
@@ -699,21 +648,22 @@ import logger from '../utils/logger';
         clearTimeout(configChangeTimerRef.current);
       }
       configChangeTimerRef.current = setTimeout(() => {
-        onConfigChange(latestConfigWithExtrasRef.current);
+        onConfigChange(latestConfigWithExtrasRef.current, generation);
         configChangeTimerRef.current = null;
       }, 200);
     }
-  }, [config, currentLeg, premiumBasedCapital, dataLoaded]); // ? Added dataLoaded to deps
+  }, [config, currentLeg, dataLoaded]); // ? Added dataLoaded to deps
 
-  // Flush any still-pending debounced update the moment this component
-  // unmounts (e.g. user switches tabs right after typing), so the parent
-  // App.jsx always ends up with the final edited value -- nothing is lost.
+  
   useEffect(() => {
     return () => {
       if (configChangeTimerRef.current) {
         clearTimeout(configChangeTimerRef.current);
         if (onConfigChange && latestConfigWithExtrasRef.current) {
-          onConfigChange(latestConfigWithExtrasRef.current);
+          // Stamped with THIS builder's generation. After a reset the app has
+          // moved on, and a flush from the builder being torn down is dropped
+          // rather than landing on top of the fresh strategy.
+          onConfigChange(latestConfigWithExtrasRef.current, generation);
         }
       }
     };
@@ -726,31 +676,6 @@ import logger from '../utils/logger';
     }
   }, [saveCompletedCounter]);
 
-  // REMOVED: Auto-refresh of compare data after backtest completion
-  // Compare data will only be fetched when user clicks "Compare Backtest" button
-  // useEffect(() => {
-  //   if (backtestCompletedCounter > 0 && strategyId && config.strategy_name) {
-  //     const refreshCompareData = async () => {
-  //       try {
-  //         console.log('[StrategyBuilder] Backtest completed, waiting 1 second before fetching compare data...');
-  //         await new Promise(resolve => setTimeout(resolve, 1000));
-  //         
-  //         console.log('[StrategyBuilder] Fetching compare data for strategy:', strategyId, config.strategy_name);
-  //         const result = await compareBacktests(strategyId, config.strategy_name);
-  //         if (result.success && result.data) {
-  //           setCompareData(result.data);
-  //           console.log('[StrategyBuilder] Compare data refreshed after backtest:', result.data.length, 'versions');
-  //           console.log('[StrategyBuilder] Latest version:', result.data[0]?.version, 'created at:', result.data[0]?.created_at);
-  //         } else {
-  //           console.warn('[StrategyBuilder] Compare data fetch returned no data or failed');
-  //         }
-  //       } catch (error) {
-  //         console.error('[StrategyBuilder] Failed to refresh compare data after backtest:', error);
-  //       }
-  //     };
-  //     refreshCompareData();
-  //   }
-  // }, [backtestCompletedCounter, strategyId, config.strategy_name]);
 
   useEffect(() => {
     const buttonShouldBeEnabled = hasConfigChanged();
@@ -776,7 +701,9 @@ import logger from '../utils/logger';
     // comparison to arrive at an answer we already know for certain here.
     setUserMadeChanges(true);
 
-    const numericConfigFields = ['dte_filter', 'initial_capital', 'lot_size', 'strategy_sl_value', 
+    // NOTE: dte_filter is deliberately NOT here — it now holds the Index name
+    // (e.g. "sensex"), not a number.
+    const numericConfigFields = ['lot_size', 'strategy_sl_value',
                                  'strategy_target_value', 'overall_stop_loss_value', 
                                  'overall_target_value', 'lock_profit_value1', 'lock_profit_value2',
                                  'overall_reentry_sl_count', 'overall_reentry_tgt_count',
@@ -816,12 +743,7 @@ import logger from '../utils/logger';
     }
     
     if (field === 'dte_filter' && !isLoadingConfigRef.current) {
-      let newExpiry;
-      if (value === 'combined' || value === 'combine_dte') {
-        newExpiry = '1dte';
-      } else {
-        newExpiry = value === '0' ? '0dte' : '1dte';
-      }
+      const newExpiry = 'weekly';
       
       newConfig.legs = config.legs.map(leg => ({
         ...leg,
@@ -836,164 +758,41 @@ import logger from '../utils/logger';
       }
     }
     
+    // DTE/strategy-type compatibility validations removed (Indian version).
+
     if (field === 'strategy_type') {
-      const currentDTE = config.dte_filter;
-      const isCombined = currentDTE === 'combined' || currentDTE === 'combine_dte';
-      
-      
-      if (isCombined && dataLoaded && (value === 'intraday' || value === 'sequential')) {
-        // Auto-scroll to Data Selection section
-        if (dataSelectionRef.current) {
-          dataSelectionRef.current.scrollIntoView({ 
-            behavior: 'smooth', 
-            block: 'start'
-          });
-        }
-        
-        // Focus DTE Filter field after scroll
-        setTimeout(() => {
-          if (dteFilterRef.current) {
-            dteFilterRef.current.focus();
-          }
-        }, 500); // Wait for scroll to complete
-        
-        setResponsePopup({ 
-          type: 'error', 
-          title: 'Data incompatible with strategy type',
-          message: `Combined DTE data is already loaded. "${value.toUpperCase()}" strategy only works with 0DTE or 1DTE. Please change DTE Filter to 0DTE or 1DTE and reload data first.`
-        });
-        return; // Don't update the value
-      }
-      
-      if (isCombined && !dataLoaded && (value === 'intraday' || value === 'sequential')) {
-        // Auto-scroll to Data Selection section
-        if (dataSelectionRef.current) {
-          dataSelectionRef.current.scrollIntoView({ 
-            behavior: 'smooth', 
-            block: 'start'
-          });
-        }
-        
-        // Focus DTE Filter field after scroll
-        setTimeout(() => {
-          if (dteFilterRef.current) {
-            dteFilterRef.current.focus();
-          }
-        }, 500); // Wait for scroll to complete
-        
-        setResponsePopup({ 
-          type: 'error', 
-          title: 'Strategy type not compatible with Combined DTE',
-          message: `Strategy type "${value.toUpperCase()}" only works with 0DTE or 1DTE data. Combined DTE only supports BTST. Please change DTE Filter to 0DTE or 1DTE first.`
-        });
-        return; // Don't update the value
-      }
-      
-      if (!isCombined && dataLoaded && value === 'btst') {
-        const loadedDTE = currentDTE === '0' ? '0DTE' : '1DTE';
-        
-        // Auto-scroll to Data Selection section
-        if (dataSelectionRef.current) {
-          dataSelectionRef.current.scrollIntoView({ 
-            behavior: 'smooth', 
-            block: 'start'
-          });
-        }
-        
-        // Focus DTE Filter field after scroll
-        setTimeout(() => {
-          if (dteFilterRef.current) {
-            dteFilterRef.current.focus();
-          }
-        }, 500); // Wait for scroll to complete
-        
-        setResponsePopup({ 
-          type: 'error', 
-          title: 'Data incompatible with strategy type',
-          message: `${loadedDTE} data is already loaded. BTST strategy only works with Combined DTE. Please change DTE Filter to Combined and reload data first.`
-        });
-        return; // Don't update the value
-      }
-      
-      if (!isCombined && !dataLoaded && value === 'btst') {
-        // Auto-scroll to Data Selection section
-        if (dataSelectionRef.current) {
-          dataSelectionRef.current.scrollIntoView({ 
-            behavior: 'smooth', 
-            block: 'start'
-          });
-        }
-        
-        // Focus DTE Filter field after scroll
-        setTimeout(() => {
-          if (dteFilterRef.current) {
-            dteFilterRef.current.focus();
-          }
-        }, 500); // Wait for scroll to complete
-        
-        setResponsePopup({ 
-          type: 'error', 
-          title: 'Strategy type not compatible with single DTE',
-          message: 'BTST strategy type only works with Combined DTE. Please change DTE Filter to Combined first, or select Intraday/Sequential strategy type.'
-        });
-        return; // Don't update the value
-      }
-    }
-    
-    if (field === 'strategy_type') {
-      if (value === 'btst' && config.dte_filter === '0') {
-        if (dataSelectionRef.current) {
-          dataSelectionRef.current.scrollIntoView({ 
-            behavior: 'smooth', 
-            block: 'start'
-          });
-        }
-        
-        setDteValidationError('Please select Combined (0DTE + 1DTE) and load data again.');
-        
-        setTimeout(() => {
-          setDteValidationError(null);
-        }, 5000);
-        
-        return;
-      }
-      
-      setDteValidationError(null);
-      
-      if (value === 'btst') {
-        const isCombined = config.dte_filter === 'combined' || config.dte_filter === 'combine_dte';
-        
-        if (!isCombined) {
-          newConfig.dte_filter = 'combine_dte';
-        } else {
-        }
-        
-        if (!isLoadingConfigRef.current) {
-          newConfig.legs = config.legs.map(leg => ({
-            ...leg,
-            expiry: '1dte'
-          }));
-          setCurrentLeg(prev => ({ 
-            ...prev,
-            expiry: '1dte'
-          }));
-        }
-        
-        if (dataLoaded && !isCombined) {
-          setDataLoaded(false);
-          setDataStatus(null);
-        }
-      } else if (value === 'intraday' || value === 'sequential') {
+      // Every type except BTST resets legs to a points-based stop loss.
+      if (value === 'intraday' || value === 'sequential' || value === 'positional') {
         newConfig.legs = config.legs.map(leg => ({
           ...leg,
           stop_loss_mode: 'points'
         }));
         setCurrentLeg(prev => ({ ...prev, stop_loss_mode: 'points' }));
-        
-        const isCombined = config.dte_filter === 'combined' || config.dte_filter === 'combine_dte';
-        if (dataLoaded && isCombined) {
-          setDataLoaded(false);
-          setDataStatus(null);
+        const toMinutes = (t) => {
+          if (!t || t.length !== 5 || !t.includes(':')) return null;
+          const [h, m] = t.split(':').map(Number);
+          return Number.isNaN(h) || Number.isNaN(m) ? null : h * 60 + m;
+        };
+        const toHHMM = (mins) =>
+          `${String(Math.floor(mins / 60)).padStart(2, '0')}:${String(mins % 60).padStart(2, '0')}`;
+
+        const entryMins = toMinutes(newConfig.entry_time);
+        const exitMins = toMinutes(newConfig.exit_time);
+        const LAST_MINUTE = 23 * 60 + 59;
+
+        if (!isOvernightType(value)
+          && entryMins !== null && exitMins !== null
+          && exitMins <= entryMins && entryMins < LAST_MINUTE) {
+          const defaultExit = toMinutes(DEFAULT_EXIT_TIME);
+          const repaired = defaultExit !== null && defaultExit > entryMins
+            ? DEFAULT_EXIT_TIME
+            : toHHMM(Math.min(entryMins + 1, LAST_MINUTE));
+          newConfig.exit_time = repaired;
+          lastValidTimeRef.current.exit_time = repaired;
+          setResponsePopup({
+            type: 'info',
+            title: `Exit Time set to ${repaired} — only BTST and Positional can exit before the entry time`,
+          });
         }
       }
     }
@@ -1004,122 +803,6 @@ import logger from '../utils/logger';
       setUserMadeChanges(true);
     } else {
     }
-  };
-
-  const fetchActualPremiums = async () => {
-    if (config.capital_mode !== 'premium_based' || config.legs.length === 0) {
-      setPremiumBasedCapital(null);
-      return;
-    }
-
-    setFetchingPremiums(true);
-    
-    try {
-      const start_date = `${config.start_year}-${config.start_month}-01`;
-      const end_date = `${config.end_year}-${config.end_month}-28`;
-      
-      const response = await fetch(`${API_URL}/get-premium-values`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          symbol: config.symbol,
-          start_date: start_date,
-          end_date: end_date,
-          dte_filter: config.dte_filter,
-          entry_time: config.entry_time,
-          legs: config.legs.map(leg => ({
-            optionType: leg.option_type.toUpperCase(),
-            strikeCriteria: leg.strike_criteria,
-            strikeType: leg.strike_type,
-            strikeValue: leg.strike_value,
-            premiumTolerance: leg.premium_tolerance
-          }))
-        })
-      });
-
-      const rawPremiumText = await response.text();
-      let data;
-      try {
-        data = rawPremiumText ? JSON.parse(rawPremiumText) : {};
-      } catch {
-        throw new Error('Server returned invalid response for premium values');
-      }
-
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to fetch premium values');
-      }
-
-      const lotSize = config.lot_size || 100;
-      const totalPremium = data.leg_premiums.reduce((sum, leg) => sum + leg.premium, 0);
-      const totalLegs = data.leg_premiums.length;
-      
-      const baseCapital = totalPremium * lotSize;
-      
-      const finalCapital = baseCapital * 10;
-      
-      setPremiumBasedCapital({
-        totalLegs,
-        totalPremium: totalPremium.toFixed(2),
-        perLegPremiums: data.leg_premiums,
-        baseCapital: baseCapital.toFixed(2),
-        finalCapital: Math.round(finalCapital),
-        lotSize,
-        underlyingPrice: data.underlying_price,
-        sampleDate: data.sample_date
-      });
-
-
-    } catch (error) {
-      logger.error('[Premium-Based Capital] Error:', error);
-      const lotSize = config.lot_size || 100;
-      const estimatedPremium = 15;
-      const totalLegs = config.legs.length;
-      const baseCapital = estimatedPremium * lotSize * totalLegs;
-      const finalCapital = baseCapital * 10;
-      
-      setPremiumBasedCapital({
-        totalLegs,
-        totalPremium: (estimatedPremium * totalLegs).toFixed(2),
-        perLegPremiums: config.legs.map(leg => ({
-          optionType: leg.option_type.toUpperCase(),
-          premium: estimatedPremium,
-          strike: 'N/A',
-          method: 'fallback'
-        })),
-        baseCapital: baseCapital.toFixed(2),
-        finalCapital: Math.round(finalCapital),
-        lotSize,
-        error: error.message
-      });
-    } finally {
-      setFetchingPremiums(false);
-    }
-  };
-
-  useEffect(() => {
-    if (config.capital_mode === 'premium_based' && 
-        config.legs.length > 0 && 
-        dataLoaded) {
-      const timer = setTimeout(() => {
-        fetchActualPremiums();
-      }, 500);
-      return () => clearTimeout(timer);
-    } else if (config.capital_mode !== 'premium_based') {
-      setPremiumBasedCapital(null);
-    }
-  }, [
-    config.legs.length, 
-    config.capital_mode, 
-    config.start_month,    // ? NEW: Recalculate when start month changes
-    config.start_year,     // ? NEW: Recalculate when start year changes
-    config.end_month,      // ? NEW: Recalculate when end month changes
-    config.end_year,       // ? NEW: Recalculate when end year changes
-    config.dte_filter,     // ? Recalculate when DTE changes
-    dataLoaded
-  ]); // ? Trigger on date changes
-
-  const calculatePremiumBasedCapital = () => {
-    return premiumBasedCapital;
   };
 
   const handleNumberFocus = (e) => {
@@ -1194,9 +877,6 @@ import logger from '../utils/logger';
     }
     
     
-    if (strategyId && onResetStrategyId) {
-      onResetStrategyId();
-    }
     
     let straddleId;
     
@@ -1233,7 +913,7 @@ import logger from '../utils/logger';
     
     const legWithTime = {
       ...currentLeg,
-      id: Date.now(),
+      id: nextLegId(),
       straddle_id: straddleId,
       option_type: (currentLeg.option_type || 'call').toLowerCase(),  // call/put
       position: (currentLeg.position || 'buy').toLowerCase(),  // buy/sell
@@ -1253,8 +933,7 @@ import logger from '../utils/logger';
       legs: [...config.legs, legWithTime]
     };
     setConfig(newConfig);
-    
-    setPremiumBasedCapital(null);
+    pendingScrollLegRef.current = legWithTime.id;
   };
 
 
@@ -1268,13 +947,13 @@ import logger from '../utils/logger';
       : `lazy${lazyLegNumber}`;
     
     const lazyLeg = {
-      id: Date.now(),
+      id: nextLegId(),
       isLazyLeg: true,  // Mark as lazy leg
       lazyLegNumber: lazyLegNumber,  // For display purposes
       customName: displayName,  // NEW: Store the custom or default name
       
       lots: lazyLegConfig.lots || 1,
-      expiry: lazyLegConfig.expiry || '0dte',
+      expiry: lazyLegConfig.expiry || 'weekly',
       position: lazyLegConfig.position || 'buy',
       option_type: lazyLegConfig.option_type || 'call',
       
@@ -1300,15 +979,15 @@ import logger from '../utils/logger';
       trail_lock_value: lazyLegConfig.trail_sl_lock_value || '',
       
       reentry_tgt_enabled: lazyLegConfig.reentry_tgt_enabled || false,
-      reentry_tgt_mode: lazyLegConfig.reentry_tgt_mode || 're_cost',
-      reentry_tgt_count: lazyLegConfig.reentry_tgt_count || '1.00',
+      reentry_tgt_mode: lazyLegConfig.reentry_tgt_mode || 're_asap',
+      reentry_tgt_count: lazyLegConfig.reentry_tgt_count || '1',
       
       reentry_sl_enabled: lazyLegConfig.reentry_sl_enabled || false,
-      reentry_sl_mode: lazyLegConfig.reentry_sl_mode || 're_cost',
-      reentry_sl_count: lazyLegConfig.reentry_sl_count || '1.00',
+      reentry_sl_mode: lazyLegConfig.reentry_sl_mode || 're_asap',
+      reentry_sl_count: lazyLegConfig.reentry_sl_count || '1',
       
       momentum_enabled: lazyLegConfig.momentum_enabled || false,
-      momentum_type: lazyLegConfig.momentum_type || 'points_up',
+      momentum_type: lazyLegConfig.momentum_type || 'points',
       momentum_value: lazyLegConfig.momentum_value || '',
       
       range_breakout_enabled: lazyLegConfig.range_breakout_enabled || false,
@@ -1341,13 +1020,15 @@ import logger from '../utils/logger';
       legs: updatedLegs
     };
     setConfig(newConfig);
-    
+    // Bring the newly created lazy leg into view, the same way Add / Copy do.
+    pendingScrollLegRef.current = lazyLeg.id;
+
     setShowLazyLegModal(false);
     setLazyLegContext(null);
     setLazyLegConfig({
       customName: '',
       lots: 1,
-      expiry: '0dte',
+      expiry: 'weekly',
       position: 'buy',
       option_type: 'call',
       strike_criteria: 'based on points',
@@ -1369,113 +1050,115 @@ import logger from '../utils/logger';
       trail_sl_value: '0.00',
       trail_sl_lock_value: '0.00',
       reentry_tgt_enabled: false,
-      reentry_tgt_mode: 're_cost',
-      reentry_tgt_count: '1.00',
+      reentry_tgt_mode: 're_asap',
+      reentry_tgt_count: '1',
       reentry_sl_enabled: false,
-      reentry_sl_mode: 're_cost',
-      reentry_sl_count: '1.00',
+      reentry_sl_mode: 're_asap',
+      reentry_sl_count: '1',
       momentum_enabled: false,
-      momentum_type: 'points_up',
+      momentum_type: 'points',
       momentum_value: '0.00',
       range_breakout_enabled: false,
       range_instrument: 'underlying',
-      range_time: '14.45',
+      range_time: '',
       range_direction: 'high'
     });
     
   };
 
-  // Memoized handler to remove a leg - stable reference prevents LegCard re-renders
   const removeLeg = useCallback((id) => {
-    setConfig(prev => ({
-      ...prev,
-      legs: prev.legs.filter(leg => leg.id !== id)
-    }));
-    setPremiumBasedCapital(null);
-  }, []); // Changed: wrapped in useCallback with functional setState
+    // Removing a main leg also removes the sequential leg attached to it,
+    // otherwise the child is orphaned and never renders again.
+    const remaining = config.legs.filter(leg => leg.id !== id && leg.parentLegId !== id);
 
-  // Memoized handler to duplicate a leg - stable reference prevents LegCard re-renders
+    // Scroll to the nearest surviving leg *before* the one being deleted.
+    const removedIndex = config.legs.findIndex(l => l.id === id);
+    for (let i = removedIndex - 1; i >= 0; i--) {
+      if (remaining.some(r => r.id === config.legs[i].id)) {
+        pendingScrollLegRef.current = config.legs[i].id;
+        break;
+      }
+    }
+
+    setConfig(prev => ({ ...prev, legs: remaining }));
+  }, [config.legs]);
+
+  const openSequentialLegModal = useCallback((parentLeg) => {
+    const existing = config.legs.find(l => l.isSequentialLeg && l.parentLegId === parentLeg.id);
+    if (existing) {
+      const label = existing.customName && !/^SEQ\d+$/i.test(existing.customName)
+        ? existing.customName
+        : `SEQ${mainLegPosition(config.legs, parentLeg.id)}`;
+      setResponsePopup({ type: 'error', title: `${label} already created` });
+      return;
+    }
+    setSequentialLegParentId(parentLeg.id);
+    setShowSequentialLegModal(true);
+  }, [config.legs]);
+
   const duplicateLeg = useCallback((legIndex, leg) => {
-    setConfig(prev => {
-      const updated = [...prev.legs];
-      let duplicatedLeg = { ...leg, id: Date.now() };
+    const updated = [...config.legs];
+    let duplicatedLeg = { ...leg, id: nextLegId() };
+    let insertAt = legIndex + 1;
 
-      if (leg.isLazyLeg) {
-        const existingLazyLegs = updated.filter(l => l.isLazyLeg);
-        duplicatedLeg.lazyLegNumber = existingLazyLegs.length + 1;
+    if (leg.isLazyLeg) {
+      const existingLazyLegs = updated.filter(l => l.isLazyLeg);
+      duplicatedLeg.lazyLegNumber = existingLazyLegs.length + 1;
+      // Copy naming: lazy2 -> lazy3 (next in the lazyN sequence); a custom name
+      // like "densi" -> densi1 -> densi2 ... (always unique among lazy legs).
+      const currentName = (leg.customName || `lazy${leg.lazyLegNumber}`).trim();
+      const takenNames = new Set(existingLazyLegs.map(l => (l.customName || `lazy${l.lazyLegNumber}`).trim()));
+      let newName;
+      if (/^lazy\d+$/.test(currentName)) {
+        let n = 0;
+        takenNames.forEach(nm => { const m = nm.match(/^lazy(\d+)$/); if (m) n = Math.max(n, parseInt(m[1], 10)); });
+        newName = `lazy${n + 1}`;
+      } else {
+        const m = currentName.match(/^(.*?)(\d+)$/);
+        const root = m ? m[1] : currentName;
+        const escaped = root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        let n = 0;
+        takenNames.forEach(nm => {
+          const mm = nm.match(new RegExp('^' + escaped + '(\\d+)$'));
+          if (mm) n = Math.max(n, parseInt(mm[1], 10));
+        });
+        newName = `${root}${n + 1}`;
+      }
+      duplicatedLeg.customName = newName;
+    } else if (leg.isSequentialLeg) {
+      const mainLegs = updated.filter(l => !l.isLazyLeg && !l.isSequentialLeg);
+      const target = mainLegs.find(
+        m => !updated.some(sl => sl.isSequentialLeg && sl.parentLegId === m.id)
+      );
+
+      if (!target) {
+        setResponsePopup({ type: 'error', title: 'Every leg already has a sequential leg' });
+        return;
       }
 
-      updated.splice(legIndex + 1, 0, duplicatedLeg);
-      return { ...prev, legs: updated };
-    });
-  }, []); // Changed: wrapped in useCallback with functional setState
+      const targetNumber = mainLegs.findIndex(m => m.id === target.id) + 1;
+      duplicatedLeg.parentLegId = target.id;
+      duplicatedLeg.sequentialLegNumber = targetNumber;
+      duplicatedLeg.customName = `SEQ${targetNumber}`;
+      insertAt = updated.findIndex(l => l.id === target.id) + 1;
+    }
+
+    updated.splice(insertAt, 0, duplicatedLeg);
+    setConfig(prev => ({ ...prev, legs: updated }));
+    pendingScrollLegRef.current = duplicatedLeg.id;
+  }, [config.legs]);
 
   const clearAllLegs = () => {
     const newConfig = { ...config, legs: [] };
     setConfig(newConfig);
   };
   const handleSubmit = async () => {
-    // Variable to store updated strategy info after auto-save
     let updatedStrategyId = strategyId;
-    let updatedStrategyName = config.strategy_name;
+    let updatedStrategyName = config.strategy_name || contextStrategyName;
     let updatedVersion = contextVersion;
 
-    // Auto-save strategy before backtest if it's a loaded/saved strategy with changes
-    if (strategyId && strategyId !== -999 && strategyId !== '-999' && userMadeChanges && config.strategy_name) {
-      try {
-        // Show saving status
-        setResponsePopup({ 
-          type: 'info', 
-          title: 'Saving changes before backtest...' 
-        });
-
-        // Pass the current config directly to save callback
-        const saveResult = await onSaveStrategy(config);
-        
-        if (!saveResult) {
-          // Save failed
-          setResponsePopup({ 
-            type: 'error', 
-            title: 'Failed to save changes. Please try again.' 
-          });
-          logger.error('[BACKTEST] Auto-save failed: No result returned');
-          return; // Don't proceed with backtest
-        }
-
-        // CRITICAL: Extract updated strategy info from save result
-        updatedStrategyId = saveResult.strategy_id || saveResult.data?.strategy_id || strategyId;
-        updatedStrategyName = saveResult.strategy_name || saveResult.data?.strategy_name || config.strategy_name;
-        updatedVersion = saveResult.version || saveResult.data?.version || contextVersion || 1;
-        
-        console.log('[BACKTEST] Auto-save completed, updated values:', {
-          strategy_id: updatedStrategyId,
-          strategy_name: updatedStrategyName,
-          version: updatedVersion
-        });
-
-        // REMOVED: Auto-refresh of compare data after save
-        // Compare data will only be fetched when user clicks "Compare Backtest" button
-
-        // Clear the popup before proceeding to backtest
-        setResponsePopup(null);
-      } catch (error) {
-        // Save failed - show error and stop
-        setResponsePopup({ 
-          type: 'error', 
-          title: 'Failed to save changes. Please try again.' 
-        });
-        logger.error('[BACKTEST] Auto-save failed:', error);
-        return; // Don't proceed with backtest
-      }
-    }
-
-    if (!config.symbol) {
-      alert('Please select a symbol');
-      return;
-    }
-    
     if (!config.start_date || !config.end_date) {
-      alert('Please select both start and end dates');
+      setResponsePopup({ type: 'error', title: 'Please select both start and end dates' });
       return;
     }
     
@@ -1485,45 +1168,135 @@ import logger from '../utils/logger';
         start_date: config.start_date,
         end_date: config.end_date
       });
-      alert('Invalid date format. Please select dates from the calendar.');
+      setResponsePopup({ type: 'error', title: 'Please select valid Start and End dates' });
       return;
     }
     
     if (new Date(config.end_date) < new Date(config.start_date)) {
-      alert('End date must be after start date');
+      setResponsePopup({ type: 'error', title: 'End date must be after start date' });
       return;
     }
 
-    if (!dataLoaded) {
-      alert('⚠️ Historical data not loaded!\n\nPlease click the "Load Data" button first to load historical data before running the backtest.');
-      return;
-    }
+    /*
+      The "Please load data first" gate is gone with the Load Data button.
+      Preparing data is the user's own step now, so the backtest goes straight
+      out and the backend answers for whatever it has.
+    */
     
     if (!config.strategy_type) {
-      alert('Please select a strategy type');
+      setResponsePopup({ type: 'error', title: 'Please select a strategy type' });
       return;
     }
     
     if (config.legs.length === 0) {
-      alert('Please add at least one leg');
+      setResponsePopup({ type: 'error', title: 'Please add at least one leg' });
       return;
     }
 
-    const timeFormatRegex = /^\d{2}:\d{2}$/;
-    if (!config.entry_time || !timeFormatRegex.test(config.entry_time)) {
-      alert('Please enter a valid Entry Time (HH:MM)');
-      return;
-    }
-    if (!config.exit_time || !timeFormatRegex.test(config.exit_time)) {
-      alert('Please enter a valid Exit Time (HH:MM)');
-      return;
-    }
-    {
-      const [eh, em] = config.entry_time.split(':').map(Number);
-      const [xh, xm] = config.exit_time.split(':').map(Number);
-      if (eh * 60 + em >= xh * 60 + xm) {
-        alert('Entry Time must be before Exit Time');
+    // Sequential strategy: every main leg must carry a sequential leg.
+    if (config.strategy_type === 'sequential') {
+      const missing = config.legs
+        .filter(l => !l.isLazyLeg && !l.isSequentialLeg)
+        .filter(l => !config.legs.some(s => s.isSequentialLeg && s.parentLegId === l.id))
+        .map(l => `LEG #${mainLegPosition(config.legs, l.id)}`);
+
+      if (missing.length > 0) {
+        setResponsePopup({ type: 'error', title: `Please add sequential leg for ${missing.join(', ')}` });
         return;
+      }
+    }
+
+    const timeError = entryExitError(config.strategy_type, config.entry_time, config.exit_time);
+    if (timeError) {
+      setResponsePopup({ type: 'error', title: timeError });
+      return;
+    }
+
+
+    const legsError = noLegsError(config);
+    if (legsError) {
+      setResponsePopup({ type: 'error', title: legsError });
+      return;
+    }
+
+  
+    const rangeDteError = rangeBreakoutDteError(config);
+    if (rangeDteError) {
+      setResponsePopup({ type: 'error', title: rangeDteError });
+      return;
+    }
+
+ 
+    const dayError = positionalDayError(config.positional_entry_day, config.positional_exit_day);
+    if (dayError) {
+      setResponsePopup({ type: 'error', title: dayError });
+      return;
+    }
+
+ 
+    const expiryError = positionalExpiryError();
+    if (expiryError) {
+      setResponsePopup({ type: 'error', title: expiryError });
+      return;
+    }
+
+
+    if (config.delay_restart_enabled) {
+      const delayError = delayRestartError(config.delay_restart_time);
+      if (delayError) {
+        setResponsePopup({ type: 'error', title: delayError });
+        return;
+      }
+    }
+
+
+    const reallyChanged = (() => {
+      if (!originalConfig) return false;
+      try {
+        const a = { ...config, currentLeg: undefined, dataLoaded: undefined };
+        const b = { ...originalConfig, currentLeg: undefined, dataLoaded: undefined };
+        return JSON.stringify(a) !== JSON.stringify(b);
+      } catch { return userMadeChanges; }
+    })();
+
+    if (strategyId && strategyId !== -999 && strategyId !== '-999' && reallyChanged) {
+      try {
+        const saveResult = await onSaveStrategy(
+          { ...config, strategy_name: config.strategy_name || contextStrategyName },
+          { silent: true },
+        );
+
+        if (!saveResult) {
+          // Save failed
+          setResponsePopup({
+            type: 'error',
+            title: 'Failed to save changes. Please try again.'
+          });
+          logger.error('[BACKTEST] Auto-save failed: No result returned');
+          return; // Don't proceed with backtest
+        }
+
+        // CRITICAL: Extract updated strategy info from save result
+        updatedStrategyId = saveResult.strategy_id || saveResult.data?.strategy_id || strategyId;
+        updatedStrategyName = saveResult.strategy_name || saveResult.data?.strategy_name || config.strategy_name;
+        updatedVersion = saveResult.version || saveResult.data?.version || contextVersion || 1;
+
+        console.log('[BACKTEST] Auto-save completed, updated values:', {
+          strategy_id: updatedStrategyId,
+          strategy_name: updatedStrategyName,
+          version: updatedVersion
+        });
+
+     
+        setResponsePopup(null);
+      } catch (error) {
+        // Save failed - show error and stop
+        setResponsePopup({
+          type: 'error',
+          title: 'Failed to save changes. Please try again.'
+        });
+        logger.error('[BACKTEST] Auto-save failed:', error);
+        return; // Don't proceed with backtest
       }
     }
 
@@ -1534,20 +1307,6 @@ import logger from '../utils/logger';
       if (!time) return '00:00:00';
       const parts = time.split(':');
       return `${(parts[0] || '00').padStart(2, '0')}:${(parts[1] || '00').padStart(2, '0')}:00`;
-    };
-
-    const parseStrikeType = (strikeType) => {
-      if (!strikeType || strikeType === 'atm') return { sign: '', strikes: 0 };
-      const lc = strikeType.toLowerCase();
-      if (lc.startsWith('itm_')) {
-        const n = parseInt(lc.replace('itm_', ''), 10);
-        return { sign: '-', strikes: isNaN(n) ? 1 : n };
-      }
-      if (lc.startsWith('otm_')) {
-        const n = parseInt(lc.replace('otm_', ''), 10);
-        return { sign: '+', strikes: isNaN(n) ? 1 : n };
-      }
-      return { sign: '', strikes: 0 };
     };
 
     const formatStrikeTypeForBackend = (strikeType) => {
@@ -1583,6 +1342,9 @@ import logger from '../utils/logger';
       return mapped;
     };
 
+    const isPremiumRange = (criteria) => !!criteria && getMappedStrikeCriteria(criteria) === 'premium range';
+    const isClosestPremium = (criteria) => !!criteria && getMappedStrikeCriteria(criteria) === 'closest premium';
+
     const typeMap = {
       'points':                'POINTS',
       'percentage':            'PERCENT',
@@ -1612,9 +1374,9 @@ import logger from '../utils/logger';
     };
 
     const normalizeMomentumType = (momentumMode) => {
-      if (!momentumMode) return 'PERCENT_DOWN';
-      const lower = momentumMode.toLowerCase();
-      return momentumModeMap[lower] || momentumMode.toUpperCase();
+      if (!momentumMode) return 'POINTS_UP';
+      const lower = String(momentumMode).toLowerCase();
+      return momentumModeMap[lower] || String(momentumMode).toUpperCase();
     };
 
     const reentryModeMap = {
@@ -1648,7 +1410,7 @@ import logger from '../utils/logger';
         lot_size:             toNumber(leg.lots),
         position_type:        (leg.position || 'buy').toUpperCase(),
         option_type:          (leg.option_type || 'call').toLowerCase(),
-        expiry_type:          leg.expiry ? leg.expiry : '0dte',
+        expiry_type:          leg.expiry ? leg.expiry : 'weekly',
         strike_criteria:      getMappedStrikeCriteria(leg.strike_criteria).toLowerCase(),
         atm_strike:           (leg.strike_criteria === 'based on points' || leg.strike_criteria === 'based_on_points' ||
                                leg.strike_criteria === 'based on atm percent' || leg.strike_criteria === 'based_on_atm_percent' ||
@@ -1659,12 +1421,12 @@ import logger from '../utils/logger';
                                leg.strike_criteria === 'based_on_atm_percent' ||
                                leg.strike_criteria === 'atm percentage')
                               ? (leg.atm_percent_direction === '-' ? '-' : '+')
-                              : parseStrikeType(leg.strike_type).sign,
-        premium_value:        (leg.strike_criteria === 'closest premium' || leg.strike_criteria === 'closest_premium')
-                                ? toNumber(leg.strike_value)
-                                : ((leg.strike_criteria === 'premium range' || leg.strike_criteria === 'premium_range') ? toNumber(leg.premium_tolerance) : 0),
-        lower_range:          toNumber(leg.lower_range),
-        upper_range:          toNumber(leg.upper_range),
+                              : '',   // ITM/OTM: the direction is already in atm_strike
+        premium_value:        isClosestPremium(leg.strike_criteria)
+                                ? toNumber(leg.closest_premium_value ?? leg.strike_value)
+                                : (isPremiumRange(leg.strike_criteria) ? toNumber(leg.premium_tolerance) : 0),
+        lower_range:          isPremiumRange(leg.strike_criteria) ? toNumber(leg.lower_range) : 0,
+        upper_range:          isPremiumRange(leg.strike_criteria) ? toNumber(leg.upper_range) : 0,
         multiplier_percentage: (leg.strike_criteria === 'based on atm percent' || 
                                leg.strike_criteria === 'based_on_atm_percent' ||
                                leg.strike_criteria === 'atm percentage')
@@ -1687,12 +1449,24 @@ import logger from '../utils/logger';
         reentry_target_type:  null,
         reentry_target_value: 0,
         is_simple_momentum:   leg.momentum_enabled || false,
-        momentum_type:        normalizeMomentumType(leg.momentum_mode),
+        momentum_type:        normalizeMomentumType(leg.momentum_mode || leg.momentum_type),
         momentum_value:       toNumber(leg.momentum_value),
         ...(leg.isLazyLeg ? {} : {
           is_range_breakout:    leg.range_enabled || false,
           range_breakout_type:  leg.range_enabled ? (leg.range_instrument === 'instrument' ? 'Instrument' : 'Underlying') : null,
-          range_end_time:       leg.range_enabled ? formatTime(leg.range_time) : null,
+          // End of the breakout window. BTST sends "today"/"tomorrow"; Positional
+      // sends the DTE number AS A STRING. Must stay identical to the save
+      // builder in strategyApi.js.
+      range_end_day: (() => {
+        if (!leg.range_enabled) return null;
+        const st = (config.strategy_type || '').toLowerCase();
+        const v = String(leg.range_end_day ?? '');
+        // Each type accepts only ITS OWN shape — must match strategyApi.js.
+        if (st === 'btst') return (v === 'today' || v === 'tomorrow') ? v : 'today';
+        if (st === 'positional') return /^\d+$/.test(v) ? v : '0';
+        return null;
+      })(),
+      range_end_time:       leg.range_enabled ? formatTime(leg.range_time) : null,
           range_on:             leg.range_enabled ? ((leg.range_direction || 'high').charAt(0).toUpperCase() + (leg.range_direction || 'high').slice(1)) : null,
         }),
       };
@@ -1757,12 +1531,11 @@ import logger from '../utils/logger';
       const legObject = buildLegObject(leg, idx, allLegs);
       
       if (config.strategy_type === 'sequential') {
-        const mainLegIndex = allLegs.findIndex(l => l.id === leg.id);
-        const sequentialLeg = allLegs.find(l => l.isSequentialLeg && l.parentLegIndex === mainLegIndex);
-        
+        const sequentialLeg = allLegs.find(l => l.isSequentialLeg && l.parentLegId === leg.id);
+
         if (sequentialLeg) {
           const sequentialLegObject = buildLegObject(sequentialLeg, idx, allLegs);
-          sequentialLegObject.leg_name = sequentialLeg.customName || `SEQ#${sequentialLeg.sequentialLegNumber}`;
+          sequentialLegObject.leg_name = sequentialLeg.customName || `SEQ${sequentialLeg.sequentialLegNumber}`;
           legObject.sequential_leg = sequentialLegObject;
         }
       }
@@ -1774,33 +1547,43 @@ import logger from '../utils/logger';
     });
 
     
-    
+    const resolvedStrategyId = updatedStrategyId || strategyId || -999;
+    const isUnsavedStrategy =
+      !resolvedStrategyId || resolvedStrategyId === -999 || resolvedStrategyId === '-999';
+
+    const isPositional = (config.strategy_type || '').toLowerCase() === 'positional';
+
+    const isDelayRestartOn =
+      ['btst', 'positional'].includes((config.strategy_type || '').toLowerCase())
+      && Boolean(config.delay_restart_enabled);
+
     const strategyObject = {
-      strategy_id:                     updatedStrategyId || strategyId || -999,  // Use updated ID from save result
-      strategy_name:                   updatedStrategyName || config.strategy_name || `strategy_${Date.now()}`,  // Use updated name from save result
-      version:                         updatedVersion || contextVersion || 1,  // Use updated version from save result
-      action:                          'save',
-      symbol:                          config.symbol,
+      strategy_id:                     resolvedStrategyId,  // Use updated ID from save result
+      strategy_name:                   updatedStrategyName || config.strategy_name || contextStrategyName || null,
+      version:                         isUnsavedStrategy
+                                         ? 0
+                                         : (updatedVersion || contextVersion || 1),
+      // Index dropdown selection (Data Selection section).
+      symbol:                          config.dte_filter,
       start_date:                      config.start_date,
       end_date:                        config.end_date,
-      dte_filter:                      (() => {
-        if (config.strategy_type === 'btst') {
-          if (config.dte_filter === 'combined' || config.dte_filter === 'combine_dte') {
-            return 1;
-          }
-          return config.dte_filter ? toNumber(config.dte_filter) : 1;
-        }
-        return toNumber(config.dte_filter);
-      })(),
       underlying_type:                 config.underlying_from === 'futures' ? 'futures' : 'cash',
       is_squareoff:                    config.square_off === 'complete',
       is_trail_sl_break_even:          config.trail_to_be || false,
       trail_sl_break_even_type:        config.trail_sl_break_even_type && config.trail_sl_break_even_type !== 'na' ? normalizeType(config.trail_sl_break_even_type) : 'POINTS',
       strategy_type:                   (config.strategy_type || 'intraday').toUpperCase(),
+      // Positional-only keys — must stay identical to strategyApi.js.
+      ...(isPositional ? {
+        positional_expire_on:          config.positional_expiry || 'weekly',
+        positional_entry_day:          toNumber(config.positional_entry_day),
+        positional_exit_day:           toNumber(config.positional_exit_day),
+      } : {}),
       entry_time:                      formatTime(config.entry_time),
       entry_delay:                     0,
       exit_time:                       formatTime(config.exit_time),
       exit_delay:                      0,
+      is_delay_restart:                isDelayRestartOn,
+      delay_restart_time:              isDelayRestartOn ? formatTime(config.delay_restart_time || MARKET_OPEN_TIME) : null,
       is_strategy_sl:                  config.overall_stop_loss_enabled || false,
       strategy_sl_type:                normalizeType(config.overall_stop_loss_mode),
       strategy_sl_value:               toNumber(config.overall_stop_loss_value),
@@ -1814,7 +1597,12 @@ import logger from '../utils/logger';
       overall_reentry_target_type:     config.overall_reentry_tgt_enabled ? (reentryModeMap[config.overall_reentry_tgt_mode] || (config.overall_reentry_tgt_mode ? config.overall_reentry_tgt_mode.toUpperCase() : 'RE_ASAP')) : null,
       overall_reentry_target_value:    config.overall_reentry_tgt_enabled ? toNumber(config.overall_reentry_tgt_count) : 0,
       is_overall_trail_sl:             config.lock_profit_enabled || false,
-      overall_trail_sl_type:           config.lock_profit_enabled ? normalizeType(config.lock_profit_mode) : 'POINTS',
+      // Overall Trail SL's MTM option is reported to the backend as POINTS.
+      overall_trail_sl_type:           config.lock_profit_enabled
+                                         ? (String(config.lock_profit_mode || 'mtm').toLowerCase() === 'mtm'
+                                             ? 'POINTS'
+                                             : normalizeType(config.lock_profit_mode))
+                                         : 'POINTS',
       overall_instrument_move:         config.lock_profit_enabled ? toNumber(config.lock_profit_value1) : 0,
       overall_stoploss_move:           config.lock_profit_enabled ? toNumber(config.lock_profit_value2) : 0,
       leg_count:                       legsArray.length,
@@ -1847,7 +1635,7 @@ import logger from '../utils/logger';
         logger.error('[BACKTEST] PAYLOAD VALIDATION FAILED:');
         logger.error('[BACKTEST] Missing Fields:', payloadValidation.missingFields);
         logger.error('[BACKTEST] Invalid Types:', payloadValidation.invalidTypes);
-        alert(`Payload Validation Error:\n${payloadValidation.missingFields.join('\n')}`);
+        setResponsePopup({ type: 'error', title: `Payload Validation Error:\n${payloadValidation.missingFields.join('\n')}` });
         return;
       }
 
@@ -1863,17 +1651,38 @@ import logger from '../utils/logger';
     } catch (error) {
       logger.error('[BACKTEST] CRITICAL ERROR IN BACKTEST HANDLER');
       logger.error('[BACKTEST] Error:', error.message);
-      alert(`Backtest Error: ${error.message}`);
+      setResponsePopup({ type: 'error', title: `Backtest Error: ${error.message}` });
     }
   };
+
+
+  const startBacktestRef = useRef(null);
+  useEffect(() => {
+    startBacktestRef.current = handleSubmit;
+  });
+
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      // Shift+Enter only — the shortcut shown on the button.
+      if (e.key !== 'Enter' || e.repeat || !e.shiftKey) return;
+      if (isLoading || isLoadingStrategy || document.querySelector('.fixed.inset-0')) return;
+      e.preventDefault();
+      startBacktestRef.current?.();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isLoading, isLoadingStrategy]);
 
   const validatePayload = (payload) => {
     const missingFields = [];
     const invalidTypes = [];
     
+    // action and dte_filter were dropped from the payload entirely, so the
+    // validator must not demand them — it silently refused every backtest when
+    // it did, with only a console error to show for it.
     const requiredStrategyFields = [
-      'action', 'strategy_name', 'symbol', 'start_date', 'end_date',
-      'dte_filter', 'underlying_type', 'is_squareoff', 'is_trail_sl_break_even',
+      'strategy_name', 'symbol', 'start_date', 'end_date',
+      'underlying_type', 'is_squareoff', 'is_trail_sl_break_even',
       'strategy_type', 'entry_time', 'exit_time', 'leg_count'
     ];
     
@@ -1897,9 +1706,8 @@ import logger from '../utils/logger';
       }
     }
     
-    if (typeof payload.strategy.dte_filter !== 'number') {
-      invalidTypes.push(`strategy.dte_filter should be number, got ${typeof payload.strategy.dte_filter}`);
-    }
+    // dte_filter is intentionally always null now — expiry travels per-leg
+    // as expiry_type — so it is no longer type-checked here.
     if (typeof payload.strategy.is_squareoff !== 'boolean') {
       invalidTypes.push(`strategy.is_squareoff should be boolean, got ${typeof payload.strategy.is_squareoff}`);
     }
@@ -1977,7 +1785,7 @@ import logger from '../utils/logger';
       } else if (errorMsg.includes('No trades found')) {
         errorMsg = 'No trades to export. Try running backtest with different settings.';
       }
-      alert('CSV Download Failed:\n\n' + errorMsg);
+      setResponsePopup({ type: 'error', title: 'CSV Download Failed: ' + errorMsg });
     }
   };
 
@@ -2012,7 +1820,7 @@ import logger from '../utils/logger';
       } else if (errorMsg.includes('No trades found')) {
         errorMsg = 'No trades to export. Try running backtest with different settings.';
       }
-      alert('Excel Download Failed:\n\n' + errorMsg);
+      setResponsePopup({ type: 'error', title: 'Excel Download Failed: ' + errorMsg });
     }
   };
 
@@ -2020,13 +1828,13 @@ import logger from '../utils/logger';
     
     if (!strategyId || strategyId === -999 || strategyId === '-999') {
       logger.error('[Compare] Invalid strategy ID:', strategyId);
-      alert('⚠️ Cannot compare backtest for unsaved strategy.\n\nPlease save the strategy first before comparing.');
+      setResponsePopup({ type: 'error', title: 'Please save the strategy before comparing backtests' });
       return;
     }
     
     if (!config.strategy_name) {
       logger.error('[Compare] Missing strategy name');
-      alert('⚠️ Strategy name is missing.\n\nPlease save the strategy with a name first.');
+      setResponsePopup({ type: 'error', title: 'Please save the strategy with a name first' });
       return;
     }
     
@@ -2055,7 +1863,7 @@ import logger from '../utils/logger';
       
       if (result.success) {
         if (!result.data || result.data.length === 0) {
-          alert('⚠️ No backtest versions found.\n\nPlease run a backtest first to generate comparison data.');
+          setResponsePopup({ type: 'error', title: 'Run a backtest first to generate comparison data' });
           return;
         }
         setCompareData(result.data);
@@ -2068,19 +1876,17 @@ import logger from '../utils/logger';
       logger.error('[Compare] Error object:', error);
       logger.error('[Compare] Error message:', error.message);
       logger.error('[Compare] Error stack:', error.stack);
-      alert(`Failed to load comparison data:\n\n${error.message}`);
+      setResponsePopup({ type: 'error', title: `Failed to load comparison data:\n\n${error.message}` });
     } finally {
       setLoadingCompare(false);
     }
   };
 
-  // Function to scroll to parameters section after loading a version
   const handleScrollToParameters = () => {
     if (dataSelectionRef.current) {
       // Close the compare sidebar first
       setCompareSidebarOpen(false);
       
-      // Small delay to ensure sidebar closes first, then scroll
       setTimeout(() => {
         dataSelectionRef.current?.scrollIntoView({ 
           behavior: 'smooth', 
@@ -2094,14 +1900,14 @@ import logger from '../utils/logger';
   const loadData = async () => {
 
     if (!config.start_date || !config.end_date) {
-      const errorMsg = '⚠️ Please select both Start Date and End Date before loading data';
+      const errorMsg = 'Please select both Start Date and End Date before loading data';
       logger.error('[Load Data]', errorMsg);
       setDataStatus(errorMsg);
       setResponsePopup({ type: 'error', title: errorMsg });
       return;
     }
     if (new Date(config.end_date) < new Date(config.start_date)) {
-      const errorMsg = '⚠️ End Date must be after Start Date';
+      const errorMsg = 'End Date must be after Start Date';
       logger.error('[Load Data]', errorMsg);
       setDataStatus(errorMsg);
       setResponsePopup({ type: 'error', title: errorMsg });
@@ -2111,85 +1917,81 @@ import logger from '../utils/logger';
     setLoadingData(true);
     setDataLoaded(false);
 
-    let dteType;
-    if (config.dte_filter === 'combine_dte') {
-      dteType = 'combined_dte';
-    } else if (config.dte_filter === 'combined') {
-      dteType = 'combined_dte';
-    } else {
-      dteType = config.dte_filter === '0' || config.dte_filter === 0 ? '0dte' : '1dte';
-    }
-    
     const requestPayload = {
       start_date: config.start_date,
       end_date:   config.end_date,
-      dte_type:   dteType,
-      symbol:     config.symbol,
+      // Index dropdown selection (Data Selection section) — sent as symbol.
+      symbol:     config.dte_filter,
     };
 
 
     try {
-      const response = await fetch(`${API_URL}/load-data`, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        body:    JSON.stringify(requestPayload),
-      });
+      /*
+        LOAD DATA IS COMMENTED OUT, not deleted.
 
-      const rawText = await response.text();
-      let result;
-      try {
-        result = rawText ? JSON.parse(rawText) : {};
-      } catch {
-        throw new Error(`Server returned invalid response (HTTP ${response.status})`);
-      }
+        The button that called it is gone -- preparing data is now the user's
+        own step. The request body was { start_date, end_date, symbol } and
+        the reply only ever set three pieces of LOCAL UI state: dataLoaded,
+        rowCount and dataStatus. Nothing persisted, and nothing else in the
+        app read them, so removing the call costs no data.
 
-
-      if (!response.ok) {
-        const detail = result.detail;
-        let errMsg;
-        if (Array.isArray(detail) && detail.length > 0) {
-          errMsg = detail.map(d => d.msg).join('; ');
-        } else if (detail && typeof detail === 'object') {
-          errMsg = detail.message || detail.error || JSON.stringify(detail);
-        } else {
-          errMsg = result.message || result.error || `Error ${response.status}`;
-        }
-        setDataLoaded(false);
-        setRowCount(0);
-        setDataStatus(`✗ ${errMsg}`);
-        setResponsePopup({ type: 'error', title: errMsg });
-        return;
-      }
-
-      if (result.success) {
-        const data           = result.data || {};
-        const actualRowCount = typeof data.rows === 'number'         ? data.rows
-                             : typeof data.record_count === 'number' ? data.record_count
-                             : 0;
-        const backendMessage = data.message || result.message || 'Data loaded successfully';
-
-        if (actualRowCount === 0) {
-          setDataLoaded(false);
-          setRowCount(0);
-          setDataStatus('⚠️ No trading days found');
-          setResponsePopup({ type: 'error', title: backendMessage });
-        } else {
-          setDataLoaded(true);
-          setRowCount(actualRowCount);
-          setDataStatus(`✓ ${backendMessage}`);
-          setResponsePopup({ type: 'success', title: backendMessage });
-          
-          // Auto-select BTST strategy type if Combined DTE is loaded
-          const isCombinedDTE = config.dte_filter === 'combine_dte' || config.dte_filter === 'combined';
-          if (isCombinedDTE && config.strategy_type !== 'btst') {
-            setConfig(prev => ({ ...prev, strategy_type: 'btst' }));
-            console.log('[Load Data] Combined DTE loaded - automatically changed Strategy Type to BTST');
-          }
-        }
-      } else {
-        throw new Error(result.error || result.message || 'Load failed');
-      }
-
+        Kept verbatim so re-enabling it is uncommenting, not rewriting.
+      */
+      // const response = await fetch(`${API_URL}/load-data`, {
+      // method:  'POST',
+      // headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      // body:    JSON.stringify(requestPayload),
+      // });
+      //
+      // const rawText = await response.text();
+      // let result;
+      // try {
+      // result = rawText ? JSON.parse(rawText) : {};
+      // } catch {
+      // throw new Error(`Server returned invalid response (HTTP ${response.status})`);
+      // }
+      //
+      //
+      // if (!response.ok) {
+      // const detail = result.detail;
+      // let errMsg;
+      // if (Array.isArray(detail) && detail.length > 0) {
+      // errMsg = detail.map(d => d.msg).join('; ');
+      // } else if (detail && typeof detail === 'object') {
+      // errMsg = detail.message || detail.error || JSON.stringify(detail);
+      // } else {
+      // errMsg = result.message || result.error || `Error ${response.status}`;
+      // }
+      // setDataLoaded(false);
+      // setRowCount(0);
+      // setDataStatus(`✗ ${errMsg}`);
+      // setResponsePopup({ type: 'error', title: errMsg });
+      // return;
+      // }
+      //
+      // if (result.success) {
+      // const data           = result.data || {};
+      // const actualRowCount = typeof data.rows === 'number'         ? data.rows
+      // : typeof data.record_count === 'number' ? data.record_count
+      // : 0;
+      // const backendMessage = data.message || result.message || 'Data loaded successfully';
+      //
+      // if (actualRowCount === 0) {
+      // setDataLoaded(false);
+      // setRowCount(0);
+      // setDataStatus('No trading days found');
+      // setResponsePopup({ type: 'error', title: backendMessage });
+      // } else {
+      // setDataLoaded(true);
+      // setRowCount(actualRowCount);
+      // setDataStatus(`✓ ${backendMessage}`);
+      // setResponsePopup({ type: 'success', title: backendMessage });
+      // }
+      // } else {
+      // throw new Error(result.error || result.message || 'Load failed');
+      // }
+      //
+      //
     } catch (error) {
       const msg = error.name === 'TypeError'
         ? 'Cannot reach server'
@@ -2206,1771 +2008,1118 @@ import logger from '../utils/logger';
 
   return (
 
-    <div className="min-h-screen bg-gray-50 pb-32">
+        <div id={readOnly ? 'strategy-readonly-content' : 'strategy-pdf-content'}
+             className={readOnly ? 'strategy-readonly' : 'min-h-screen pb-16'}
+             style={{ backgroundColor: colors.page.background }}>
       <ToggleSwitchStyles />
-      <div className="mx-12">
+      <div className="mx-0">
         
-        {/* Data Selection Card */}
-        <div ref={dataSelectionRef} className="bg-white rounded-lg shadow-xl border border-white mb-8 w-full animate-fade-in">
-          {/* Header */}
-          <div className="px-8 py-4 border-b border-slate-100 bg-white">
-            <h3 className="text-lg font-bold flex items-center gap-2 uppercase" style={{ color: '#4682b4' }}>
-              <Calendar size={18} style={{ color: '#4682b4' }} />
-              Data Selection
-            </h3>
-          </div>
-          
-          {/* DTE Validation Error Message */}
-          {dteValidationError && (
-            <div className="mx-8 mt-4 px-4 py-3 bg-red-50 border-l-4 border-red-500 rounded-r-lg flex items-center gap-3">
-              <svg xmlns="http://www.w3.org/2000/svg" className="w-6 h-6 text-red-500 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-              </svg>
-              <span className="text-red-700 font-semibold text-sm">{dteValidationError}</span>
-            </div>
-          )}
-          
-          {/* Content */}
-          <div className="px-10 py-10 w-full">
-            {/* Flex Layout with uniform field widths and consistent spacing */}
-            <div className="flex flex-nowrap items-end gap-17">
-              {/* Symbol */}
-              <div className="flex-shrink-0" style={{ width: '180px' }}>
-                <label className="block text-base font-semibold text-slate-700 mb-2">Symbol</label>
-                <select 
-                  ref={symbolRef}
-                  value={config.symbol} 
-                  onChange={(e) => handleChange('symbol', e.target.value)}
-                  onKeyDown={(e) => handleFieldNavigation(e, symbolRef)}
-                  className="w-full px-6 py-3 border border-slate-300 rounded-2xl focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white text-lg font-medium hover:border-slate-400 hover:shadow-md hover:-translate-y-0.5 transition-all duration-200"
-                >
-                  <option value="SPXW">SPXW</option>
-                </select>
-              </div>
+        {/*
+          DATA SELECTION WAS HERE and has been removed.
+        */}
 
-              {/* DTE Filter */}
-              <div className="flex-shrink-0" style={{ width: '180px' }}>
-                <label className="block text-base font-semibold text-slate-700 mb-2">DTE Filter</label>
-                <select 
-                  ref={dteFilterRef}
-                  value={config.dte_filter} 
-                  onChange={(e) => {
-                    const newDteFilter = e.target.value;
-                    handleChange('dte_filter', newDteFilter);
+      <div
+        className="builder-two-col mx-auto grid grid-cols-1 gap-6 md:grid-cols-[39%_61%] mb-8 animate-fade-in"
+        style={{ fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" }}
+      >
+
+        <div className="flex flex-col gap-14">
+
+          {/* Instrument Settings */}
+          <div data-pdf-block id={INSTRUMENT_SECTION_ID} style={{ scrollMarginTop: 16 }}>
+            <h2 className="text-[20px] font-normal mb-2.5" style={{ color: colors.settingsPanel.heading }}>Instrument settings</h2>
+            <div className="bg-white rounded-lg border p-8 flex flex-col items-center gap-7" style={{ borderColor: colors.settingsPanel.cardBorder, boxShadow: colors.settingsPanel.cardShadow }}>
+
+              <div className="flex items-center justify-between gap-4 w-full max-w-[18rem]">
+                <label className="text-[13px] font-medium whitespace-nowrap" style={{ color: colors.settingsPanel.label }}>Index</label>
+                <select
+                  value={config.dte_filter || DEFAULT_SYMBOL}
+                  onChange={(e) => handleChange('dte_filter', e.target.value)}
+                  className="appearance-none pl-3 pr-9 py-2 border rounded-md text-[13px] font-normal w-40 outline-none cursor-pointer"
+                  style={{
+                    backgroundColor: colors.dropdownPlain.background,
+                    color: colors.settingsPanel.inputValue,
+                    borderColor: colors.settingsPanel.fieldBorder,
+                    backgroundImage: selectChevron('%234B5563'),
+                    backgroundRepeat: 'no-repeat',
+                    backgroundPosition: 'right 0.65rem center',
                   }}
-                  onKeyDown={(e) => handleFieldNavigation(e, dteFilterRef)}
-                  className="w-full px-6 py-3 border border-slate-300 rounded-2xl focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white text-lg font-medium hover:border-slate-400 hover:shadow-md hover:-translate-y-0.5 transition-all duration-200"
                 >
-                  <option value="0">0DTE</option>
-                  <option value="1">1DTE</option>
-                  <option value="combine_dte">Combined DTE</option>
+                  {SUPPORTED_INDEXES.map((ix) => (
+                    <option key={ix.value} value={ix.value}>{ix.label}</option>
+                  ))}
                 </select>
               </div>
 
-              {/* Start Date - Segmented DD/MM/YYYY with single-click */}
-              <div className="flex-shrink-0" style={{ width: '180px' }}>
-                <label className="block text-base font-semibold text-slate-700 mb-2">Start Date</label>
-                <DateSegmentInput
-                  ref={startDateRef}
-                  value={config.start_date} 
-                  onCommit={(newValue) => handleChange('start_date', newValue)}
-                  onKeyDown={(e) => handleFieldNavigation(e, startDateRef)}
-                  placeholder="Start Date"
+              {/* Underlying From — REAL, wired to config.underlying_from */}
+              <div className="flex items-center justify-between gap-3 w-full max-w-[18rem]">
+                <label className="text-[13px] font-medium whitespace-nowrap flex items-center gap-1.5" style={{ color: colors.settingsPanel.label }}>
+                  Underlying from
+                  <Info size={14} className="text-gray-400" />
+                </label>
+                <SegmentedGroup
+                  options={[{ value: 'cash', label: 'Cash' }, { value: 'futures', label: 'Futures' }]}
+                  value={config.underlying_from}
+                  onChange={(v) => handleChange('underlying_from', v)}
                 />
               </div>
-
-              {/* End Date - Segmented DD/MM/YYYY with single-click */}
-              <div className="flex-shrink-0" style={{ width: '180px' }}>
-                <label className="block text-base font-semibold text-slate-700 mb-2">End Date</label>
-                <DateSegmentInput
-                  ref={endDateRef}
-                  value={config.end_date} 
-                  onCommit={(newValue) => handleChange('end_date', newValue)}
-                  onKeyDown={(e) => handleFieldNavigation(e, endDateRef)}
-                  placeholder="End Date"
-                />
-              </div>
-
-              {/* Load Data Button */}
-              <div className="flex flex-col gap-1 flex-shrink-0" style={{ width: '180px' }}>
-              <button 
-                ref={loadDataRef}
-                onClick={loadData}
-                onKeyDown={(e) => handleFieldNavigation(e, loadDataRef)}
-                disabled={loadingData}
-                className={`w-full px-6 py-3 rounded-2xl font-bold text-lg transition-all duration-200 shadow-md border hover:shadow-xl hover:-translate-y-1 hover:scale-105 active:translate-y-0 active:scale-95 text-white ${
-                  dataLoaded 
-                    ? 'bg-green-600 hover:bg-green-700 border-green-700' 
-                    : 'border-blue-700'
-                } disabled:opacity-60 disabled:cursor-not-allowed disabled:hover:translate-y-0 disabled:hover:scale-100 disabled:hover:shadow-md`}
-                style={!dataLoaded ? { backgroundColor: '#4682b4' } : {}}
-              >
-                {loadingData ? (
-                  <span className="flex items-center justify-center gap-2">
-                    <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"></path>
-                    </svg>
-                    Loading...
-                  </span>
-                ) : dataLoaded ? '✓ Loaded' : 'Load Data'}
-              </button>
-              </div>
-
             </div>
-
           </div>
-        </div>
 
-      {/* Instrument Settings - Full Width */}
-      <div className="bg-white rounded-lg shadow-xl border border-white mb-8 animate-fade-in">
-        {/* Header */}
-        <div className="px-6 py-4 border-b border-slate-100 bg-white">
-          <h3 className="text-lg font-bold flex items-center gap-2 uppercase" style={{ color: '#4682b4' }}>
-            <Info size={18} style={{ color: '#4682b4' }} />
-            Instrument Settings
-          </h3>
-        </div>
-
-        {/* Content */}
-        <div className="p-6">
-          <div className="flex flex-wrap items-center gap-17">
-            {/* Underlying From */}
-            <div className="flex items-center gap-4">
-              <label className="text-base font-semibold text-slate-700">Underlying From</label>
-              <div className="flex gap-2">
-                {['cash', 'futures'].map(type => (
-                  <button 
-                    key={type} 
-                    onClick={() => handleChange('underlying_from', type)} 
-                    className={`px-6 py-2 text-sm font-bold rounded-lg border hover:scale-105 hover:shadow-md active:scale-95 transition-all duration-200 ${
-                      config.underlying_from === type 
-                        ? 'text-white border-blue-700' 
-                        : 'bg-white text-slate-800 border-slate-300'
-                    }`}
-                    style={config.underlying_from === type ? { backgroundColor: '#4682b4' } : {}}
-                  >
-                    {type === 'cash' ? 'Cash' : 'Futures'}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* Square Off */}
-            <div className="flex items-center gap-4">
-              <label className="text-base font-semibold text-slate-700">Square Off</label>
-              <div className="flex gap-2">
-                {['partial', 'complete'].map(type => (
-                  <button 
-                    key={type} 
-                    onClick={() => handleChange('square_off', type)} 
-                    className={`px-6 py-2 text-sm font-bold rounded-lg border hover:scale-105 hover:shadow-md active:scale-95 transition-all duration-200 ${
-                      config.square_off === type 
-                        ? 'text-white border-blue-700' 
-                        : 'bg-white text-slate-800 border-slate-300'
-                    }`}
-                    style={config.square_off === type ? { backgroundColor: '#4682b4' } : {}}
-                  >
-                    {type === 'partial' ? 'Partial' : 'Complete'}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* Trail SL to Break-even - Inline without card */}
-            <div className="flex items-center justify-between gap-6 py-4 border-b border-slate-200">
+          {/* Legwise Settings */}
+          <div data-pdf-block>
+            <h2 className="text-[20px] font-normal mb-2.5" style={{ color: colors.settingsPanel.heading }}>Legwise settings</h2>
+            <div className="bg-white rounded-lg border p-8 flex flex-col items-center gap-7" style={{ borderColor: colors.settingsPanel.cardBorder, boxShadow: colors.settingsPanel.cardShadow }}>
+              {/* Square Off — REAL, wired to config.square_off */}
               <div className="flex items-center gap-3">
-                <label className="text-base font-semibold text-slate-700">Trail SL to Break Even</label>
-                <Info size={18} className="text-blue-400" />
+                <label className="text-[13px] font-medium whitespace-nowrap flex items-center gap-1.5" style={{ color: colors.settingsPanel.label }}>
+                  Square Off
+                  <Info size={14} className="text-gray-400" />
+                </label>
+                <SegmentedGroup
+                  options={[{ value: 'partial', label: 'Partial' }, { value: 'complete', label: 'Complete' }]}
+                  value={config.square_off}
+                  onChange={(v) => handleChange('square_off', v)}
+                />
               </div>
-              <ToggleSwitch 
-                checked={config.trail_to_be || false}
-                onChange={(e) => handleChange('trail_to_be', e.target.checked)}
-                id="trailToBreakEven"
-              />
-            </div>
 
-            {/* All Legs / SL Legs scope toggle - only relevant once Trail SL to Break Even is on */}
-            {config.trail_to_be && (
-              <div className="flex items-center justify-between gap-6 py-4 border-b border-slate-200">
-                <div className="flex items-center gap-3">
-                  <span className="text-base font-semibold text-slate-700">Trail Scope</span>
-                  <span className={`text-sm font-semibold transition-colors ${
-                    (config.trail_to_be_scope || 'all_legs') === 'all_legs' ? 'text-slate-600' : 'text-slate-400'
-                  }`}>
-                    All Legs
-                  </span>
-                  <ToggleSwitch
-                    checked={(config.trail_to_be_scope || 'all_legs') === 'sl_legs'}
-                    onChange={(e) => handleChange('trail_to_be_scope', e.target.checked ? 'sl_legs' : 'all_legs')}
-                    id="trailToBreakEvenScope"
-                  />
-                  <span className={`text-sm font-semibold transition-colors ${
-                    config.trail_to_be_scope === 'sl_legs' ? 'text-slate-600' : 'text-slate-400'
-                  }`}>
-                    SL Legs
-                  </span>
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
-
-      {/* Entry Settings - Full Width */}
-      <div className="bg-white rounded-lg shadow-xl border border-white mb-8 animate-fade-in">
-        {/* Header */}
-        <div className="px-6 py-4 border-b border-slate-100 bg-white">
-          <h3 className="text-lg font-bold flex items-center gap-2 uppercase" style={{ color: '#4682b4' }}>
-            <Clock size={18} style={{ color: '#4682b4' }} />
-            Entry Settings
-          </h3>
-        </div>
-
-        {/* Content - Full Width Layout */}
-        <div className="p-6">
-          <div className="flex flex-wrap items-center gap-17">
-            {/* Strategy Type - Dropdown Select */}
-            <div className="flex items-center gap-6 relative">
-              <label className="text-base font-semibold text-slate-700 whitespace-nowrap">Strategy Type</label>
-              <select 
-                ref={strategyTypeRef}
-                value={config.strategy_type || 'intraday'}
-                onChange={(e) => handleChange('strategy_type', e.target.value)}
-                onKeyDown={(e) => handleEntrySettingsNavigation(e, strategyTypeRef)}
-                className="px-6 py-3 border border-slate-300 rounded-2xl bg-white text-slate-700 text-lg font-medium focus:ring-2 focus:ring-blue-500 focus:border-transparent cursor-pointer w-40 appearance-none pr-10"
-                style={{
-                  backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%234b5563' d='M6 9L1 4h10z'/%3E%3C/svg%3E")`,
-                  backgroundRepeat: 'no-repeat',
-                  backgroundPosition: 'right 12px center'
-                }}
-              >
-                <option value="intraday">Intraday</option>
-                <option value="btst">BTST</option>
-                <option value="sequential">Sequential</option>
-              </select>
-            </div>
-
-            {/* Entry Time */}
-            <div className="flex items-center gap-6">
-              <label className="text-base font-semibold text-slate-700 whitespace-nowrap">Entry Time (UTC)</label>
-              <TimeSegmentInput
-                ref={entryTimeRef}
-                value={config.entry_time}
-                onCommit={(formatted) => commitTime('entry_time', formatted)}
-                placeholder="Entry Time"
-                onKeyDown={(e) => handleEntrySettingsNavigation(e, entryTimeRef)}
-              />
-            </div>
-
-            {/* Exit Time */}
-            <div className="flex items-center gap-6">
-              <label className="text-base font-semibold text-slate-700 whitespace-nowrap">Exit Time (UTC)</label>
-              <TimeSegmentInput
-                ref={exitTimeRef}
-                value={config.exit_time}
-                onCommit={(formatted) => commitTime('exit_time', formatted)}
-                placeholder="Exit Time"
-                onKeyDown={(e) => handleEntrySettingsNavigation(e, exitTimeRef)}
-              />
-            </div>
-
-          </div>
-        </div>
-      </div>
-
-      {/* LEG BUILDER - WITH MARGIN WRAPPER */}
-      <div className="mx-0 px-0 w-full">
-        {/* LEG BUILDER - MEDIUM SIZE CONTAINER */}
-        <div className="w-full bg-white rounded-lg shadow-xl border border-white mb-8">
-        <div className="px-6 py-6 bg-white rounded-t-lg">
-          <h3 className="text-2xl font-bold mb-4 whitespace-nowrap overflow-visible" style={{ color: '#4682b4' }}>LEG BUILDER</h3>
-          
-          {/* Select Segments Section */}
-          <div className="flex items-center gap-3 pb-4 border-b border-gray-300">
-            <span className="text-base font-semibold text-slate-700">Select Segments</span>
-            <button className="px-5 py-2 text-white rounded text-base font-semibold hover:shadow-lg hover:-translate-y-0.5 hover:scale-105 active:translate-y-0 active:scale-95 transition-all duration-200" style={{ backgroundColor: '#4682b4' }}>
-              Options
-            </button>
-          </div>
-        </div>
-        
-        <div className="p-6 space-y-6">
-          {/* Row 1: Total Lot / Expiry / Position / Option Type */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-17">
-            {/* Total Lot */}
-            <div className="flex flex-col">
-              <label className="text-xs font-semibold text-slate-700 mb-1">Total Lot</label>
-              <input 
-                type="number" 
-                min="0"
-                step="1"
-                value={currentLeg.lots} 
-                onChange={(e) => handleLegChange('lots', e.target.value)} 
-                onFocus={handleNumberFocus}
-                className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200" 
-              />
-            </div>
-
-            {/* Expiry */}
-            <div className="flex flex-col">
-              <label className="text-xs font-semibold text-slate-700 mb-1">Expiry</label>
-              <select 
-                value={currentLeg.expiry} 
-                onChange={(e) => handleLegChange('expiry', e.target.value)}
-                className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-              >
-                <option value="0dte">0DTE</option>
-                <option value="1dte">1DTE</option>
-              </select>
-            </div>
-
-            {/* Position */}
-            <div className="flex flex-col">
-              <label className="text-xs font-semibold text-slate-700 mb-1">Position</label>
-              <div className="flex gap-0.5 bg-gray-200 rounded-lg p-0.5">
-                <button
-                  onClick={() => handleLegChange('position', 'buy')}
-                  className={`flex-1 px-3 py-2 rounded text-sm font-semibold hover:scale-105 active:scale-95 transition-all duration-200 ${
-                    currentLeg.position === 'buy'
-                      ? 'text-white shadow-sm'
-                      : 'bg-transparent text-gray-600'
-                  }`}
-                  style={currentLeg.position === 'buy' ? { backgroundColor: '#4682b4' } : {}}
-                >
-                  Buy
-                </button>
-                <button
-                  onClick={() => handleLegChange('position', 'sell')}
-                  className={`flex-1 px-3 py-2 rounded text-sm font-semibold hover:scale-105 active:scale-95 transition-all duration-200 ${
-                    currentLeg.position === 'sell'
-                      ? 'text-white shadow-sm'
-                      : 'bg-transparent text-gray-600'
-                  }`}
-                  style={currentLeg.position === 'sell' ? { backgroundColor: '#4682b4' } : {}}
-                >
-                  Sell
-                </button>
-              </div>
-            </div>
-
-            {/* Option Type */}
-            <div className="flex flex-col">
-              <label className="text-xs font-semibold text-slate-700 mb-1">Option Type</label>
-              <div className="flex gap-0.5 bg-gray-200 rounded-lg p-0.5">
-                <button
-                  onClick={() => handleLegChange('option_type', 'call')}
-                  className={`flex-1 px-3 py-2 rounded text-sm font-semibold hover:scale-105 active:scale-95 transition-all duration-200 ${
-                    currentLeg.option_type === 'call'
-                      ? 'text-white shadow-sm'
-                      : 'bg-transparent text-gray-600'
-                  }`}
-                  style={currentLeg.option_type === 'call' ? { backgroundColor: '#4682b4' } : {}}
-                >
-                  Call
-                </button>
-                <button
-                  onClick={() => handleLegChange('option_type', 'put')}
-                  className={`flex-1 px-3 py-2 rounded text-sm font-semibold hover:scale-105 active:scale-95 transition-all duration-200 ${
-                    currentLeg.option_type === 'put'
-                      ? 'text-white shadow-sm'
-                      : 'bg-transparent text-gray-600'
-                  }`}
-                  style={currentLeg.option_type === 'put' ? { backgroundColor: '#4682b4' } : {}}
-                >
-                  Put
-                </button>
-              </div>
-            </div>
-          </div>
-
-          {/* Row 2: Strike Criteria / Nearest (or ATM Strike) */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-17">
-            {/* Strike Criteria */}
-            <div className="flex flex-col">
-              <label className="text-xs font-semibold text-slate-700 mb-1 flex items-center gap-1">
-                Strike Criteria
-                <Info size={12} className="text-slate-400" />
+              {/* Trail SL to Break-even price — REAL, wired to config.trail_to_be / config.trail_to_be_scope */}
+              <label className="flex items-center gap-2 cursor-pointer flex-wrap justify-center">
+                <input
+                  type="checkbox"
+                  checked={config.trail_to_be || false}
+                  onChange={(e) => handleChange('trail_to_be', e.target.checked)}
+                  className="appearance-none w-4 h-4 rounded border-2 cursor-pointer bg-white"
+                  style={config.trail_to_be
+                    ? {
+                        backgroundColor: colors.settingsPanel.activeBg,
+                        borderColor: colors.settingsPanel.activeBg,
+                        backgroundImage: `url("data:image/svg+xml;charset=UTF-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 6 9 17l-5-5'/%3E%3C/svg%3E")`,
+                        backgroundSize: '10px',
+                        backgroundRepeat: 'no-repeat',
+                        backgroundPosition: 'center',
+                      }
+                    : { borderColor: colors.settingsPanel.checkboxBorder }}
+                />
+                <span className="text-[13px] font-medium whitespace-nowrap flex items-center gap-1.5" style={{ color: colors.settingsPanel.label }}>
+                  Trail SL to Break-even price
+                  <Info size={14} className="text-gray-400" />
+                </span>
+                {/* Muted while the checkbox is unchecked, full blue once checked */}
+                <SegmentedGroup
+                  options={[{ value: 'all_legs', label: 'All Legs' }, { value: 'sl_legs', label: 'SL Legs' }]}
+                  value={config.trail_to_be_scope || 'all_legs'}
+                  onChange={(v) => handleChange('trail_to_be_scope', v)}
+                  muted={!config.trail_to_be}
+                />
               </label>
-              <select 
-                value={currentLeg.strike_criteria} 
-                onChange={(e) => handleLegChange('strike_criteria', e.target.value)}
-                className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-semibold text-gray-700 hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-              >
-                <option value="based on points">Based On Strike</option>
-                <option value="based on atm percent">Based On ATM %</option>
-                <option value="based on premium range">Based On premium range</option>
-                <option value="closest premium">Based On Closest Premium</option>
-              </select>
+            </div>
+          </div>
+
+        </div>
+
+        {/* RIGHT COLUMN: Entry Settings */}
+        <div data-pdf-block className="flex flex-col">
+          <h2 className="text-[20px] font-normal mb-2.5" style={{ color: colors.settingsPanel.heading }}>Entry settings</h2>
+          <div
+            className={`bg-white rounded-lg border px-8 pt-10 pb-6 flex-1 flex flex-col justify-start min-h-[400px] ${
+              (config.strategy_type || 'intraday') === 'positional' ? 'gap-12' : 'gap-[42px]'
+            }`}
+            style={{ borderColor: colors.settingsPanel.cardBorder, boxShadow: colors.settingsPanel.cardShadow }}
+          >
+
+            {/* Strategy Type — REAL, wired to config.strategy_type */}
+            <div className={(config.strategy_type || 'intraday') === 'positional'
+              ? 'flex items-center justify-center gap-10'
+              : `flex items-center justify-between gap-10 ${ROW_BLOCK}`}>
+              <label className="text-[13px] font-medium whitespace-nowrap" style={{ color: colors.settingsPanel.label }}>Strategy Type</label>
+              <SegmentedGroup
+                options={[
+                  { value: 'intraday', label: 'Intraday' },
+                  { value: 'btst', label: 'BTST' },
+                  { value: 'positional', label: 'Positional' },
+                  { value: 'sequential', label: 'Sequential' },
+                ]}
+                value={config.strategy_type || 'intraday'}
+                onChange={(v) => handleChange('strategy_type', v)}
+                accent
+                padX="px-2"
+                textSize="text-[12px]"
+                firstRef={strategyTypeRef}
+                onFirstKeyDown={(e) => handleEntrySettingsNavigation(e, strategyTypeRef)}
+              />
             </div>
 
-            {/* ATM Strike - Only show when Strike Criteria is "Based On Points" */}
-            {currentLeg.strike_criteria === 'based on points' && (
-            <div className="flex flex-col">
-              <label className="text-xs font-semibold text-slate-700 mb-1">ATM Strike</label>
-              <StrikeSelector
-                value={currentLeg.strike_type || 'atm'}
-                onChange={(value) => handleLegChange('strike_type', value)}
-              />
-              <select
-                style={{display: 'none'}}
-                value={currentLeg.strike_type || 'atm'}
-                onChange={(e) => handleLegChange('strike_type', e.target.value)}
-                className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-              >
-                <option value="itm_20">ITM-20</option>
-                <option value="itm_19">ITM-19</option>
-                <option value="itm_18">ITM-18</option>
-                <option value="itm_17">ITM-17</option>
-                <option value="itm_16">ITM-16</option>
-                <option value="itm_15">ITM-15</option>
-                <option value="itm_14">ITM-14</option>
-                <option value="itm_13">ITM-13</option>
-                <option value="itm_12">ITM-12</option>
-                <option value="itm_11">ITM-11</option>
-                <option value="itm_10">ITM-10</option>
-                <option value="itm_9">ITM-9</option>
-                <option value="itm_8">ITM-8</option>
-                <option value="itm_7">ITM-7</option>
-                <option value="itm_6">ITM-6</option>
-                <option value="itm_5">ITM-5</option>
-                <option value="itm_4">ITM-4</option>
-                <option value="itm_3">ITM-3</option>
-                <option value="itm_2">ITM-2</option>
-                <option value="itm_1">ITM-1</option>
-                <option value="atm">ATM</option>
-                <option value="otm_1">OTM-1</option>
-                <option value="otm_2">OTM-2</option>
-                <option value="otm_3">OTM-3</option>
-                <option value="otm_4">OTM-4</option>
-                <option value="otm_5">OTM-5</option>
-                <option value="otm_6">OTM-6</option>
-                <option value="otm_7">OTM-7</option>
-                <option value="otm_8">OTM-8</option>
-                <option value="otm_9">OTM-9</option>
-                <option value="otm_10">OTM-10</option>
-                  <option value="otm_11">OTM-11</option>
-                  <option value="otm_12">OTM-12</option>
-                  <option value="otm_13">OTM-13</option>
-                  <option value="otm_14">OTM-14</option>
-                  <option value="otm_15">OTM-15</option>
-                  <option value="otm_16">OTM-16</option>
-                  <option value="otm_17">OTM-17</option>
-                  <option value="otm_18">OTM-18</option>
-                  <option value="otm_19">OTM-19</option>
-                  <option value="otm_20">OTM-20</option>
-                    <option value="otm_2">OTM-2</option>
-                    <option value="otm_3">OTM-3</option>
-                    <option value="otm_4">OTM-4</option>
-                    <option value="otm_5">OTM-5</option>
-                    <option value="otm_6">OTM-6</option>
-                    <option value="otm_7">OTM-7</option>
-                    <option value="otm_8">OTM-8</option>
-                    <option value="otm_9">OTM-9</option>
-                    <option value="otm_10">OTM-10</option>
-                    <option value="otm_11">OTM-11</option>
-                    <option value="otm_12">OTM-12</option>
-                    <option value="otm_13">OTM-13</option>
-                    <option value="otm_14">OTM-14</option>
-                    <option value="otm_15">OTM-15</option>
-                    <option value="otm_16">OTM-16</option>
-                    <option value="otm_17">OTM-17</option>
-                    <option value="otm_18">OTM-18</option>
-                    <option value="otm_19">OTM-19</option>
-                    <option value="otm_20">OTM-20</option>
-                  </select>
+            {(config.strategy_type || 'intraday') === 'positional' && (
+              <div className="flex items-center justify-center gap-4">
+                <label className="text-[13px] font-normal whitespace-nowrap" style={{ color: colors.settingsPanel.sentence }}>Positional expire on a</label>
+                <select
+                  value={config.positional_expiry || 'weekly'}
+                  onChange={(e) => {
+                    const expiry = e.target.value;
+                    const err = positionalExpiryError(config.legs, expiry);
+                    if (err) setResponsePopup({ type: 'error', title: err });
+                    handleChange('positional_expiry', expiry);
+                  }}
+                  className="appearance-none pl-3 pr-9 py-2 border rounded-md text-[13px] font-normal outline-none cursor-pointer"
+                  style={{
+                    backgroundColor: colors.dropdownPlain.background,
+                    color: colors.settingsPanel.inputValue,
+                    borderColor: colors.settingsPanel.fieldBorder,
+                    backgroundImage: selectChevron('%234B5563'),
+                    backgroundRepeat: 'no-repeat',
+                    backgroundPosition: 'right 0.65rem center',
+                  }}
+                >
+                  <option value="weekly">Weekly Expiry</option>
+                  <option value="monthly">Monthly Expiry</option>
+                </select>
+                <span className="text-[13px] font-normal" style={{ color: colors.settingsPanel.sentence }}>basis</span>
               </div>
             )}
 
-            {/* ATM % - Only show when Strike Criteria is "Based On ATM %" */}
-            {currentLeg.strike_criteria === 'based on atm percent' && (
-              <div className="flex gap-2 items-end">
-                <div className="flex flex-col" style={{ width: '30%' }}>
-                  <label className="text-xs font-semibold text-slate-700 mb-1">ATM</label>
-                  <select
-                    value={currentLeg.atm_percent_direction || '+'}
-                    onChange={(e) => handleLegChange('atm_percent_direction', e.target.value)}
-                    className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-                  >
-                    <option value="+">+</option>
-                    <option value="-">-</option>
-                  </select>
-                </div>
-                <div className="flex flex-col flex-1">
-                  <label className="text-xs font-semibold text-slate-700 mb-1">%</label>
-                  <div className="relative flex items-center">
-                    <input 
-                      type="number" 
-                      min="0"
-                      step="0.01"
-                      value={currentLeg.atm_percent_value ?? ''} 
-                      onChange={(e) => handleLegChange('atm_percent_value', e.target.value)}
-                      onFocus={handleNumberFocus}
-                      className="w-full px-3 py-2 pr-10 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-                      placeholder="0"
+            {(config.strategy_type || 'intraday') === 'positional' ? (
+              <div className="entry-exit-row flex items-stretch justify-center gap-[10.5%]">
+                <div className="flex-1 flex flex-col gap-3 min-w-0">
+                  <label className="text-[13px] font-medium text-center" style={{ color: colors.settingsPanel.label }}>Entry Time</label>
+                  <TimeSegmentInput
+                    ref={entryTimeRef}
+                    value={config.entry_time}
+                    onCommit={(formatted) => commitTime('entry_time', formatted)}
+                    placeholder="Entry Time"
+                    onKeyDown={(e) => handleEntrySettingsNavigation(e, entryTimeRef)}
+                    minTime={MARKET_OPEN_TIME}
+                    maxTime={ENTRY_LAST_TIME}
+                    fullWidth
+                  />
+                  <span className="text-[13px] font-medium" style={{ color: colors.settingsPanel.label }}>Entry</span>
+                  <div className="flex items-center gap-3">
+                    <PlainDropdown
+                      value={String(config.positional_entry_day ?? '0')}
+                      options={positionalDayOptions}
+                      onChange={(v) => {
+                        warnAboutTimeLater(positionalDayError(v, config.positional_exit_day));
+                        handleChange('positional_entry_day', v);
+                      }}
+                      buttonClassName="w-[3.75rem] h-8 py-0"
                     />
-                    <span className="absolute right-3 text-sm font-medium text-gray-600 pointer-events-none">%</span>
+                    <span className="text-[13px] font-normal whitespace-nowrap" style={{ color: colors.settingsPanel.sentence }}>trading days before expiry</span>
+                  </div>
+                </div>
+
+                <div className="border-l self-stretch" style={{ borderColor: colors.settingsPanel.divider }} />
+
+                <div className="flex-1 flex flex-col gap-3 min-w-0">
+                  <label className="text-[13px] font-medium text-center" style={{ color: colors.settingsPanel.label }}>Exit Time</label>
+                  <TimeSegmentInput
+                    ref={exitTimeRef}
+                    value={config.exit_time}
+                    onCommit={(formatted) => commitTime('exit_time', formatted)}
+                    placeholder="Exit Time"
+                    onKeyDown={(e) => handleEntrySettingsNavigation(e, exitTimeRef)}
+                    minTime={MARKET_OPEN_TIME}
+                    maxTime={EXIT_LAST_TIME}
+                    fullWidth
+                  />
+                  <span className="text-[13px] font-medium" style={{ color: colors.settingsPanel.label }}>Exit</span>
+                  <div className="flex items-center gap-3">
+                    <PlainDropdown
+                      value={String(config.positional_exit_day ?? '0')}
+                      options={positionalDayOptions}
+                      onChange={(v) => {
+                        warnAboutTimeLater(positionalDayError(config.positional_entry_day, v));
+                        handleChange('positional_exit_day', v);
+                      }}
+                      buttonClassName="w-[3.75rem] h-8 py-0"
+                    />
+                    <span className="text-[13px] font-normal whitespace-nowrap" style={{ color: colors.settingsPanel.sentence }}>trading days before expiry</span>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className={`flex items-center justify-between gap-20 ${ROW_BLOCK}`}>
+                <div className="flex items-center gap-3">
+                  <label className="text-[13px] font-medium whitespace-nowrap" style={{ color: colors.settingsPanel.label }}>Entry Time</label>
+                  <div className="flex items-center gap-2">
+                    <TimeSegmentInput
+                      ref={entryTimeRef}
+                      value={config.entry_time}
+                      onCommit={(formatted) => commitTime('entry_time', formatted)}
+                      placeholder="Entry Time"
+                      onKeyDown={(e) => handleEntrySettingsNavigation(e, entryTimeRef)}
+                      minTime={MARKET_OPEN_TIME}
+                      maxTime={ENTRY_LAST_TIME}
+                    />
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-3">
+                  <label className="text-[13px] font-medium whitespace-nowrap" style={{ color: colors.settingsPanel.label }}>Exit Time</label>
+                  <div className="flex items-center gap-2">
+                    <TimeSegmentInput
+                      ref={exitTimeRef}
+                      value={config.exit_time}
+                      onCommit={(formatted) => commitTime('exit_time', formatted)}
+                      placeholder="Exit Time"
+                      onKeyDown={(e) => handleEntrySettingsNavigation(e, exitTimeRef)}
+                      minTime={MARKET_OPEN_TIME}
+                      maxTime={EXIT_LAST_TIME}
+                    />
                   </div>
                 </div>
               </div>
             )}
 
-            {/* Nearest - Only show when Strike Criteria is "Based On Closest Premium" */}
-            {currentLeg.strike_criteria === 'closest premium' && (
-              <div className="flex flex-col">
-                <label className="text-xs font-semibold text-slate-700 mb-1">Nearest</label>
-                <input 
-                  type="number" 
-                  min="0"
-                  step="0.01"
-                  value={currentLeg.closest_premium_value ?? ''} 
-                  onChange={(e) => handleLegChange('closest_premium_value', e.target.value)}
-                  onFocus={handleNumberFocus}
-                  className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-                  placeholder=""
-                />
-              </div>
-            )}
-
-            {/* Premium Range - Only show when Strike Criteria is "Based On premium range" */}
-            {currentLeg.strike_criteria === 'based on premium range' && (
-              <div className="flex gap-5">
-                <div className="flex flex-col flex-1">
-                  <label className="text-xs font-semibold text-slate-700 mb-1">Lower Range</label>
-                  <input 
-                    type="number" 
-                    value={currentLeg.lower_range ?? ''} 
-                    onChange={(e) => handleLegChange('lower_range', e.target.value)}
-                    onFocus={handleNumberFocus}
-                    className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-                    placeholder=""
-                    step="0.01"
+            {/* No re-entry after + Overall Momentum — VISUAL ONLY, local uiXxx state, not wired to config/handleChange. Wire later. */}
+            <div className={(config.strategy_type || 'intraday') === 'positional'
+              ? 'flex items-stretch justify-center gap-10'
+              : `flex items-stretch justify-between gap-10 mt-[18px] ${ROW_BLOCK}`}>
+              {['intraday', 'sequential'].includes(config.strategy_type || 'intraday') ? (
+                <div className="flex flex-col items-center gap-3">
+                  <div className="flex items-center gap-3">
+                    <label className="text-[13px] font-medium whitespace-nowrap" style={{ color: colors.settingsPanel.label }}>No re-entry after</label>
+                    <ToggleSwitch
+                      checked={config.no_reentry_after_enabled || false}
+                      onChange={(e) => handleChange('no_reentry_after_enabled', e.target.checked)}
+                      id="noReentryAfter"
+                      size="sm"
+                    />
+                  </div>
+                  <TimeSegmentInput
+                    value={config.no_reentry_after_time || '09:35'}
+                    onCommit={(v) => { handleChange('no_reentry_after_time', v); return true; }}
+                    disabled={!config.no_reentry_after_enabled}
+                    placeholder="No re-entry after"
                   />
                 </div>
-                <div className="flex flex-col flex-1">
-                  <label className="text-xs font-semibold text-slate-700 mb-1">Upper Range</label>
-                  <input 
-                    type="number" 
-                    value={currentLeg.upper_range ?? ''} 
-                    onChange={(e) => handleLegChange('upper_range', e.target.value)}
-                    onFocus={handleNumberFocus}
-                    className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-                    placeholder=""
-                    step="0.01"
+              ) : (
+                <div className="flex flex-col items-center gap-3">
+                  <div className="flex items-center gap-3">
+                    <label className="text-[13px] font-medium whitespace-nowrap" style={{ color: colors.settingsPanel.label }}>Delay restart</label>
+                    <ToggleSwitch
+                      checked={config.delay_restart_enabled || false}
+                      onChange={(e) => handleChange('delay_restart_enabled', e.target.checked)}
+                      id="delayRestart"
+                      size="sm"
+                    />
+                  </div>
+                
+                  <TimeSegmentInput
+                    value={config.delay_restart_time || MARKET_OPEN_TIME}
+                    onCommit={(v) => {
+                      warnAboutTimeLater(delayRestartError(v));
+                      handleChange('delay_restart_time', v);
+                      return true;
+                    }}
+                    disabled={!config.delay_restart_enabled}
+                    placeholder="Delay restart"
+                    minTime={MARKET_OPEN_TIME}
+                    maxTime={EXIT_LAST_TIME}
                   />
                 </div>
-              </div>
-            )}
+              )}
 
-            {/* Premium - Only show when Strike Criteria is "Premium >=" or "Premium <=" */}
-            {(currentLeg.strike_criteria === 'premium_gte' || currentLeg.strike_criteria === 'premium_lte') && (
-              <div className="flex flex-col">
-                <label className="text-xs font-semibold text-slate-700 mb-1">Premium</label>
-                <input 
-                  type="number" 
-                  value={currentLeg.premium_value ?? ''} 
-                  onChange={(e) => handleLegChange('premium_value', e.target.value)}
-                  onFocus={handleNumberFocus}
-                  className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-                  placeholder="0"
-                  step="0.01"
+              
+              <div className="pl-10 border-l flex flex-col items-center gap-3" style={{ borderColor: colors.settingsPanel.divider }}>
+                <div className="flex items-center gap-3">
+                  <label className="text-[13px] font-medium whitespace-nowrap flex items-center gap-1.5" style={{ color: colors.settingsPanel.label }}>
+                    Stop monitoring after
+                    <Info size={14} className="text-gray-400" />
+                  </label>
+                  <ToggleSwitch
+                    checked={config.stop_monitoring_enabled || false}
+                    onChange={(e) => handleChange('stop_monitoring_enabled', e.target.checked)}
+                    id="stopMonitoringAfter"
+                    size="sm"
+                  />
+                </div>
+                <TimeSegmentInput
+                  value={config.stop_monitoring_time || DEFAULT_EXIT_TIME}
+                  onCommit={(v) => {
+                    warnAboutTimeLater(sessionWindowError('Stop Monitoring After', v));
+                    handleChange('stop_monitoring_time', v);
+                    return true;
+                  }}
+                  disabled={!config.stop_monitoring_enabled}
+                  placeholder="Stop monitoring after"
+                  minTime={MARKET_OPEN_TIME}
+                  maxTime={EXIT_LAST_TIME}
                 />
               </div>
-            )}
-          </div>
+            </div>
 
-          {/* Add Leg Button */}
-          <div className="flex justify-start mt-6">
-            <button 
-              onClick={addLeg} 
-              className="px-5 py-2 text-white rounded text-base font-semibold hover:shadow-lg active:scale-95 transition-transform duration-75"
-              style={{ backgroundColor: '#4682b4' }}
-            >
-              Add Leg
-            </button>
           </div>
         </div>
+
+      </div>  
+
+
+      {/* LEG BUILDER — AlgoTest-style */}
+      <div className="mx-0 px-0 w-full" style={{ fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" }}>
+
+        {uiLegBuilderCollapsed ? (
+          /* Collapsed (AlgoTest): one slim bordered bar with the heading + Expand link */
+          <div className="w-full bg-white rounded-lg border mb-8 flex items-center justify-between px-4 py-2.5" style={{ borderColor: colors.settingsPanel.cardBorder, boxShadow: colors.settingsPanel.cardShadow }}>
+            <h2 className="text-[20px] font-normal flex items-center gap-1.5" style={{ color: colors.settingsPanel.heading }}>
+              Leg Builder
+              <Info size={14} className="text-gray-400" />
+            </h2>
+            <span onClick={() => setUiLegBuilderCollapsed(false)} className="text-[15px] font-semibold cursor-pointer select-none" style={{ color: colors.legBuilder.collapseLink }}>Expand</span>
+          </div>
+        ) : (
+          <>
+        {/* Header row (outside the card, like the settings sections) */}
+        <div className="flex items-center justify-between mb-2.5">
+          <h2 className="text-[20px] font-normal flex items-center gap-1.5" style={{ color: colors.settingsPanel.heading }}>
+            Leg Builder
+            <Info size={14} className="text-gray-400" />
+          </h2>
+          <span onClick={() => setUiLegBuilderCollapsed(true)} className="text-[15px] font-semibold cursor-pointer select-none" style={{ color: colors.legBuilder.collapseLink }}>Collapse</span>
         </div>
+
+        <div className="w-full bg-white rounded-lg border mb-8" style={{ borderColor: colors.settingsPanel.cardBorder, boxShadow: colors.settingsPanel.cardShadow }}>
+          <div className="px-8 py-10 flex flex-col gap-10">
+
+            <div className="flex flex-wrap items-end justify-center gap-x-8 gap-y-5">
+
+              {/* Select segments — "Futures" is VISUAL ONLY (uiLegSegment), not wired. Wire later. */}
+              <div className="flex flex-col gap-1.5">
+                <label className="text-[13px] font-medium h-5 leading-5" style={{ color: colors.settingsPanel.label }}>Select segments</label>
+                <SegmentedGroup
+                  className="self-start h-9"
+                  padX="px-3.5"
+                  equal
+                  accent
+                  options={[{ value: 'futures', label: 'Futures' }, { value: 'options', label: 'Options' }]}
+                  value={uiLegSegment}
+                  onChange={setUiLegSegment}
+                />
+              </div>
+
+              {/* Total Lot — REAL, wired to currentLeg.lots */}
+              <div className="flex flex-col gap-1.5">
+                <label className="text-[13px] font-medium h-5 leading-5" style={{ color: colors.settingsPanel.label }}>Total Lot</label>
+                <input
+                  type="number"
+                  min="1"
+                  step="1"
+                  value={currentLeg.lots}
+                  onChange={(e) => handleLegChange('lots', e.target.value)}
+                  onFocus={handleNumberFocus}
+                  className="lot-spinner w-24 px-3.5 h-9 text-[13px] font-normal border rounded-md bg-white outline-none"
+                  style={{ borderColor: colors.settingsPanel.fieldBorder, color: colors.settingsPanel.inputValue }}
+                />
+              </div>
+
+              {/* Position — REAL, wired to currentLeg.position */}
+              <div className="flex flex-col gap-1.5">
+                <label className="text-[13px] font-medium h-5 leading-5" style={{ color: colors.settingsPanel.label }}>Position</label>
+                <SegmentedGroup
+                  className="self-start h-9"
+                  padX="px-3.5"
+                  equal
+                  accent
+                  options={[{ value: 'buy', label: 'Buy' }, { value: 'sell', label: 'Sell' }]}
+                  value={currentLeg.position}
+                  onChange={(v) => handleLegChange('position', v)}
+                />
+              </div>
+
+              {/* Option Type — REAL, wired to currentLeg.option_type */}
+              <div className="flex flex-col gap-1.5">
+                <label className="text-[13px] font-medium h-5 leading-5" style={{ color: colors.settingsPanel.label }}>Option Type</label>
+                <SegmentedGroup
+                  className="self-start h-9"
+                  padX="px-3.5"
+                  equal
+                  accent
+                  options={[{ value: 'call', label: 'Call' }, { value: 'put', label: 'Put' }]}
+                  value={currentLeg.option_type}
+                  onChange={(v) => handleLegChange('option_type', v)}
+                />
+              </div>
+
+              <div className="flex flex-col gap-1.5">
+                <label className="text-[13px] font-medium h-5 leading-5" style={{ color: colors.settingsPanel.label }}>Expiry</label>
+                <select
+                  value={currentLeg.expiry}
+                  onChange={(e) => handleLegChange('expiry', e.target.value)}
+                  className="appearance-none w-[9.5rem] pl-3.5 pr-9 h-9 text-[13px] font-normal border rounded-md outline-none cursor-pointer"
+                  style={{
+                      backgroundColor: colors.dropdownPlain.background,
+                      color: colors.settingsPanel.inputValue,
+                      borderColor: colors.settingsPanel.fieldBorder,
+                      backgroundImage: selectChevron('%234B5563'),
+                      backgroundRepeat: 'no-repeat',
+                      backgroundPosition: 'right 0.6rem center',
+                    }}
+                >
+                  <option value="weekly">Weekly</option>
+                  <option value="next_weekly">Next Weekly</option>
+                  <option value="monthly">Monthly</option>
+                  <option value="next_monthly">Next Monthly</option>
+                </select>
+              </div>
+
+              {/* Strike Criteria — REAL, wired to currentLeg.strike_criteria (options unchanged) */}
+              <div className="flex flex-col gap-1.5">
+                <label className="text-[13px] font-medium h-5 leading-5 flex items-center gap-1" style={{ color: colors.settingsPanel.label }}>
+                  Strike Criteria
+                  <Info size={12} className="text-gray-400" />
+                </label>
+                <select
+                  value={currentLeg.strike_criteria}
+                  onChange={(e) => handleLegChange('strike_criteria', e.target.value)}
+                  className="appearance-none w-[15rem] pl-3.5 pr-9 h-9 text-[13px] font-normal border rounded-md outline-none cursor-pointer"
+                  style={{
+                      backgroundColor: colors.dropdownPlain.background,
+                      color: colors.settingsPanel.inputValue,
+                      borderColor: colors.settingsPanel.fieldBorder,
+                      backgroundImage: selectChevron('%234B5563'),
+                      backgroundRepeat: 'no-repeat',
+                      backgroundPosition: 'right 0.6rem center',
+                    }}
+                >
+                  <option value="based on points">Based On Strike</option>
+                  <option value="based on atm percent">Based On ATM %</option>
+                  <option value="based on premium range">Based On premium range</option>
+                  <option value="closest premium">Based On Closest Premium</option>
+                </select>
+              </div>
+
+              {/* Strike Type — only when Strike Criteria is "Based On Strike" (REAL, via StrikeSelector) */}
+              {currentLeg.strike_criteria === 'based on points' && (
+                <div className="flex flex-col gap-1.5 w-[7.5rem] shrink-0">
+                  <label className="text-[13px] font-medium h-5 leading-5" style={{ color: colors.settingsPanel.label }}>Strike Type</label>
+                  <StrikeSelector
+                    heightClass="h-9"
+                    size="md"
+                    value={currentLeg.strike_type || 'atm'}
+                    onChange={(value) => handleLegChange('strike_type', value)}
+                  />
+                </div>
+              )}
+
+              {/* ATM % — only when Strike Criteria is "Based On ATM %" (REAL; AlgoTest inline layout) */}
+              {currentLeg.strike_criteria === 'based on atm percent' && (
+                <div className="flex items-center gap-2">
+                  <span className="text-[13px] font-medium h-5 leading-5" style={{ color: colors.settingsPanel.label }}>ATM</span>
+                  <select
+                    value={currentLeg.atm_percent_direction || '+'}
+                    onChange={(e) => handleLegChange('atm_percent_direction', e.target.value)}
+                    className="appearance-none pl-3 pr-7 py-2 text-[13px] font-normal border rounded-md outline-none cursor-pointer"
+                    style={{
+                      backgroundColor: colors.dropdownPlain.background,
+                      color: colors.settingsPanel.inputValue,
+                      borderColor: colors.settingsPanel.fieldBorder,
+                      backgroundImage: selectChevron('%234B5563'),
+                      backgroundRepeat: 'no-repeat',
+                      backgroundPosition: 'right 0.45rem center',
+                    }}
+                  >
+                    <option value="+">+</option>
+                    <option value="-">-</option>
+                  </select>
+                  <div className="relative flex items-center">
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      value={currentLeg.atm_percent_value ?? ''}
+                      onChange={(e) => handleLegChange('atm_percent_value', e.target.value)}
+                      onFocus={handleNumberFocus}
+                      className="w-[6.25rem] pl-3.5 pr-8 h-8 text-[13px] font-normal border rounded-md bg-white outline-none"
+                      style={{ borderColor: colors.settingsPanel.fieldBorder, color: colors.settingsPanel.inputValue }}
+                      placeholder="0"
+                    />
+                    <span className="absolute right-3 text-[13px] font-medium pointer-events-none" style={{ color: colors.settingsPanel.label }}>%</span>
+                  </div>
+                  <span className="text-[13px] font-medium whitespace-nowrap" style={{ color: colors.settingsPanel.label }}>of ATM</span>
+                </div>
+              )}
+
+              {/* Premium — only when Strike Criteria is "Based On Closest Premium" (REAL) */}
+              {currentLeg.strike_criteria === 'closest premium' && (
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-[13px] font-medium h-5 leading-5" style={{ color: colors.settingsPanel.label }}>Premium</label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    value={currentLeg.closest_premium_value ?? ''}
+                    onChange={(e) => handleLegChange('closest_premium_value', e.target.value)}
+                    onFocus={handleNumberFocus}
+                    className="w-[6.25rem] px-3.5 h-8 text-[13px] font-normal border rounded-md bg-white outline-none"
+                    style={{ borderColor: colors.settingsPanel.fieldBorder, color: colors.settingsPanel.inputValue }}
+                    placeholder=""
+                  />
+                </div>
+              )}
+
+              {/* Lower/Upper Range — only when Strike Criteria is "Based On premium range" (REAL) */}
+              {currentLeg.strike_criteria === 'based on premium range' && (
+                <>
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-[13px] font-medium h-5 leading-5" style={{ color: colors.settingsPanel.label }}>Lower Range</label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={currentLeg.lower_range ?? ''}
+                      onChange={(e) => handleLegChange('lower_range', e.target.value)}
+                      onFocus={handleNumberFocus}
+                      className="w-[6.25rem] px-3.5 h-8 text-[13px] font-normal border rounded-md bg-white outline-none"
+                      style={{ borderColor: colors.settingsPanel.fieldBorder, color: colors.settingsPanel.inputValue }}
+                      placeholder=""
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-[13px] font-medium h-5 leading-5" style={{ color: colors.settingsPanel.label }}>Upper Range</label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={currentLeg.upper_range ?? ''}
+                      onChange={(e) => handleLegChange('upper_range', e.target.value)}
+                      onFocus={handleNumberFocus}
+                      className="w-[6.25rem] px-3.5 h-8 text-[13px] font-normal border rounded-md bg-white outline-none"
+                      style={{ borderColor: colors.settingsPanel.fieldBorder, color: colors.settingsPanel.inputValue }}
+                      placeholder=""
+                    />
+                  </div>
+                </>
+              )}
+
+              {/* Premium — legacy criteria "Premium >=" / "Premium <=" (REAL) */}
+              {(currentLeg.strike_criteria === 'premium_gte' || currentLeg.strike_criteria === 'premium_lte') && (
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-[13px] font-medium h-5 leading-5" style={{ color: colors.settingsPanel.label }}>Premium</label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    value={currentLeg.premium_value ?? ''}
+                    onChange={(e) => handleLegChange('premium_value', e.target.value)}
+                    onFocus={handleNumberFocus}
+                    className="w-[6.25rem] px-3.5 h-8 text-[13px] font-normal border rounded-md bg-white outline-none"
+                    style={{ borderColor: colors.settingsPanel.fieldBorder, color: colors.settingsPanel.inputValue }}
+                    placeholder="0"
+                  />
+                </div>
+              )}
+            </div>
+
+            <div className="flex justify-center">
+              <button
+                onClick={addLeg}
+                className="px-4 py-3 text-[12px] leading-4 font-semibold text-white rounded border transition-colors duration-75"
+                style={{
+                  backgroundColor: colors.legBuilder.addLegBg,
+                  borderColor: colors.legBuilder.addLegBg,
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.backgroundColor = colors.legBuilder.addLegHoverBg;
+                  e.currentTarget.style.borderColor = colors.legBuilder.addLegHoverBg;
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.backgroundColor = colors.legBuilder.addLegBg;
+                  e.currentTarget.style.borderColor = colors.legBuilder.addLegBg;
+                }}
+              >
+                Add Leg
+              </button>
+            </div>
+
+          </div>
+        </div>
+          </>
+        )}
       </div>
     </div>
 
-      {/* Lazy Leg Configuration Modal - EXACT REPLICA OF LEG BUILDER */}
       {showLazyLegModal && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-lg shadow-2xl w-full max-w-7xl max-h-[95vh] overflow-hidden flex flex-col">
-            {/* Modal Header */}
-            <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200 bg-white sticky top-0 z-10">
-              <div>
-                <h2 className="text-xl font-semibold text-gray-800">Create New Lazy Leg</h2>
-                <p className="text-xs text-gray-500 mt-1">Configure a lazy leg that will be created when re-entry condition is met</p>
-              </div>
+        <div className="fixed inset-0 flex items-center justify-center z-50 p-3" style={{ backgroundColor: 'rgba(42, 42, 42, 0.7)', fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" }}>
+          <div className="bg-white rounded-md w-full max-w-7xl max-h-[95vh] overflow-y-auto">
+            <div className="flex items-center justify-between px-4 py-3 border-b bg-[#fafafa] border-[#e3e3e3] rounded-t-md">
+              <h2 className="text-[16px] font-normal text-[#3a3a3a]">Create New Lazy Leg</h2>
               <button
                 onClick={() => {
                   setShowLazyLegModal(false);
                   setLazyLegContext(null);
                   setLazyLegConfig({
-                    customName: '',
-                    lots: 1,
-                    expiry: '0dte',
-                    position: 'buy',
-                    option_type: 'call',
-                    strike_criteria: 'based on points',
-                    atm_strike: 'atm',
-                    atm_percent_direction: '+',
-                    atm_percent_value: '',
-                    closest_premium_value: '',
-                    lower_range: '',
-                    upper_range: '',
-                    premium_value: '',
-                    target_enabled: false,
-                    target_type: 'points',
-                    target_value: '0.00',
-                    stop_loss_enabled: false,
-                    stop_loss_type: 'points',
-                    stop_loss_value: '0.00',
-                    trail_sl_enabled: false,
-                    trail_sl_type: 'points',
-                    trail_sl_value: '0.00',
-                    trail_sl_lock_value: '0.00',
-                    reentry_tgt_enabled: false,
-                    reentry_tgt_mode: 're_cost',
-                    reentry_tgt_count: '1.00',
-                    reentry_sl_enabled: false,
-                    reentry_sl_mode: 're_cost',
-                    reentry_sl_count: '1.00',
-                    momentum_enabled: false,
-                    momentum_type: 'points_up',
-                    momentum_value: '0.00',
-                    range_breakout_enabled: false,
-                    range_instrument: 'underlying',
-                    range_time: '14.45',
-                    range_direction: 'high'
+                    customName: '', lots: 1, expiry: 'weekly', position: 'buy', option_type: 'call',
+                    strike_criteria: 'based on points', atm_strike: 'atm', atm_percent_direction: '+', atm_percent_value: '',
+                    closest_premium_value: '', lower_range: '', upper_range: '', premium_value: '',
+                    target_enabled: false, target_type: 'points', target_value: '0.00',
+                    stop_loss_enabled: false, stop_loss_type: 'points', stop_loss_value: '0.00',
+                    trail_sl_enabled: false, trail_sl_type: 'points', trail_sl_value: '0.00', trail_sl_lock_value: '0.00',
+                    reentry_tgt_enabled: false, reentry_tgt_mode: 're_asap', reentry_tgt_count: '1',
+                    reentry_sl_enabled: false, reentry_sl_mode: 're_asap', reentry_sl_count: '1',
+                    momentum_enabled: false, momentum_type: 'points', momentum_value: '0.00',
+                    range_breakout_enabled: false, range_instrument: 'underlying', range_time: '', range_direction: 'high'
                   });
                 }}
-                className="text-gray-400 hover:text-gray-600 transition-colors"
+                className="w-6 h-6 p-0.5 rounded-full flex items-center justify-center text-[#555555] hover:bg-[#f3f3f3] transition-colors"
+                title="Close"
               >
-                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                </svg>
+                <X size={20} />
               </button>
             </div>
-            
-            {/* Modal Body - Scrollable Content */}
-            <div className="flex-1 overflow-y-auto">
-              {/* Name Input Section */}
-              <div className="px-6 py-4 bg-gray-50 border-b border-gray-200">
-                <label className="block text-sm font-semibold text-gray-700 mb-2">Enter Leg Name</label>
+
+            <div className="pt-4 px-5 pb-3">
+              <div className="flex items-center gap-3 mb-5">
+                <label className="text-[13px] font-medium text-gray-700 whitespace-nowrap">Enter Leg Name</label>
                 <input
-                  type="text"
                   value={lazyLegConfig.customName}
-                  onChange={(e) => setLazyLegConfig({...lazyLegConfig, customName: e.target.value})}
-                  placeholder={`lazy${config.legs.filter(leg => leg.isLazyLeg).length + 1}`}
-                  className="w-64 px-4 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
+                  onChange={(e) => setLazyLegConfig(prev => ({ ...prev, customName: e.target.value }))}
+                  placeholder={`lazy${config.legs.filter(l => l.isLazyLeg).length + 1}`}
+                  className="w-44 px-3.5 h-8 text-[13px] border rounded-md bg-white outline-none"
+                  style={{ borderColor: colors.settingsPanel.fieldBorder, color: colors.settingsPanel.inputValue }}
                 />
               </div>
-              
-              {/* LEG BUILDER REPLICA - Exact same layout as in the main component */}
-              <div className="w-full bg-white rounded-lg shadow-xl border border-white overflow-hidden animate-fade-in">
-                {/* Content */}
-                <div className="space-y-8" style={{ paddingLeft: '25px', paddingRight: '25px', paddingTop: '26px', paddingBottom: '26px' }}>
-                  {/* Row 1: Total Lot / Expiry / Position / Option Type */}
-                  <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-17">
-                    {/* Total Lot */}
-                    <div className="flex flex-col">
-                      <label className="text-xs font-semibold text-slate-700 mb-1">Total Lot</label>
-                      <input 
-                        type="number" 
-                        min="0"
-                        step="1"
-                        value={lazyLegConfig.lots} 
-                        onChange={(e) => { 
-                          const val = Number(e.target.value);
-                          if (val < 0) {
-                            setResponsePopup({ type: 'error', title: 'Total Lot cannot be negative' });
-                            return;
-                          }
-                          setLazyLegConfig({...lazyLegConfig, lots: val}); 
-                        }} 
-                        className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200" 
-                        placeholder="1"
-                      />
-                    </div>
 
-                    {/* Expiry */}
-                    <div className="flex flex-col">
-                      <label className="text-xs font-semibold text-slate-700 mb-1">Expiry</label>
-                      <select 
-                        value={lazyLegConfig.expiry} 
-                        onChange={(e) => setLazyLegConfig({...lazyLegConfig, expiry: e.target.value})} 
-                        className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-                      >
-                        <option value="0dte">0DTE</option>
-                        <option value="1dte">1DTE</option>
-                      </select>
-                    </div>
-
-                    {/* Position */}
-                    <div className="flex flex-col">
-                      <label className="text-xs font-semibold text-slate-700 mb-1">Position</label>
-                      <div className="flex gap-0.5 bg-gray-200 rounded-lg p-0.5">
-                        <button
-                          onClick={() => setLazyLegConfig({...lazyLegConfig, position: 'buy'})}
-                          className={`flex-1 px-3 py-2 rounded text-sm font-semibold hover:scale-105 active:scale-95 transition-all duration-200 ${
-                            lazyLegConfig.position === 'buy'
-                              ? 'text-white shadow-sm'
-                              : 'bg-transparent text-gray-600'
-                          }`}
-                          style={lazyLegConfig.position === 'buy' ? { backgroundColor: '#4682b4' } : {}}
-                        >
-                          Buy
-                        </button>
-                        <button
-                          onClick={() => setLazyLegConfig({...lazyLegConfig, position: 'sell'})}
-                          className={`flex-1 px-3 py-2 rounded text-sm font-semibold hover:scale-105 active:scale-95 transition-all duration-200 ${
-                            lazyLegConfig.position === 'sell'
-                              ? 'text-white shadow-sm'
-                              : 'bg-transparent text-gray-600'
-                          }`}
-                          style={lazyLegConfig.position === 'sell' ? { backgroundColor: '#4682b4' } : {}}
-                        >
-                          Sell
-                        </button>
-                      </div>
-                    </div>
-
-                    {/* Option Type */}
-                    <div className="flex flex-col">
-                      <label className="text-xs font-semibold text-slate-700 mb-1">Option Type</label>
-                      <div className="flex gap-0.5 bg-gray-200 rounded-lg p-0.5">
-                        <button
-                          onClick={() => setLazyLegConfig({...lazyLegConfig, option_type: 'call'})}
-                          className={`flex-1 px-3 py-2 rounded text-sm font-semibold hover:scale-105 active:scale-95 transition-all duration-200 ${
-                            lazyLegConfig.option_type === 'call'
-                              ? 'text-white shadow-sm'
-                              : 'bg-transparent text-gray-600'
-                          }`}
-                          style={lazyLegConfig.option_type === 'call' ? { backgroundColor: '#4682b4' } : {}}
-                        >
-                          Call
-                        </button>
-                        <button
-                          onClick={() => setLazyLegConfig({...lazyLegConfig, option_type: 'put'})}
-                          className={`flex-1 px-3 py-2 rounded text-sm font-semibold hover:scale-105 active:scale-95 transition-all duration-200 ${
-                            lazyLegConfig.option_type === 'put'
-                              ? 'text-white shadow-sm'
-                              : 'bg-transparent text-gray-600'
-                          }`}
-                          style={lazyLegConfig.option_type === 'put' ? { backgroundColor: '#4682b4' } : {}}
-                        >
-                          Put
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Row 2: Strike Criteria / ATM Strike / Dynamic Fields */}
-                  <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-17">
-                    {/* Strike Criteria */}
-                    <div className="flex flex-col">
-                      <label className="text-xs font-semibold text-slate-700 mb-1">Strike Criteria</label>
-                      <select 
-                        value={lazyLegConfig.strike_criteria} 
-                        onChange={(e) => setLazyLegConfig({...lazyLegConfig, strike_criteria: e.target.value})} 
-                        className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-                      >
-                        <option value="based on points">Based On Strike</option>
-                        <option value="based on atm percent">Based On ATM %</option>
-                        <option value="based on premium range">Based On premium range</option>
-                        <option value="closest premium">Based On Closest Premium</option>
-                      </select>
-                    </div>
-
-                    {/* ATM Strike - Only show when Strike Criteria is "Based On Strike" */}
-                    {lazyLegConfig.strike_criteria === 'based on points' && (
-                      <div className="flex flex-col">
-                        <label className="text-xs font-semibold text-slate-700 mb-1">ATM Strike</label>
-                        <select 
-                          value={lazyLegConfig.atm_strike} 
-                          onChange={(e) => setLazyLegConfig({...lazyLegConfig, atm_strike: e.target.value})} 
-                          className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-                        >
-                          <option value="itm_20">ITM-20</option>
-                          <option value="itm_19">ITM-19</option>
-                          <option value="itm_18">ITM-18</option>
-                          <option value="itm_17">ITM-17</option>
-                          <option value="itm_16">ITM-16</option>
-                          <option value="itm_15">ITM-15</option>
-                          <option value="itm_14">ITM-14</option>
-                          <option value="itm_13">ITM-13</option>
-                          <option value="itm_12">ITM-12</option>
-                          <option value="itm_11">ITM-11</option>
-                          <option value="itm_10">ITM-10</option>
-                          <option value="itm_9">ITM-9</option>
-                          <option value="itm_8">ITM-8</option>
-                          <option value="itm_7">ITM-7</option>
-                          <option value="itm_6">ITM-6</option>
-                          <option value="itm_5">ITM-5</option>
-                          <option value="itm_4">ITM-4</option>
-                          <option value="itm_3">ITM-3</option>
-                          <option value="itm_2">ITM-2</option>
-                          <option value="itm_1">ITM-1</option>
-                          <option value="atm">ATM</option>
-                          <option value="otm_1">OTM-1</option>
-                          <option value="otm_2">OTM-2</option>
-                          <option value="otm_3">OTM-3</option>
-                          <option value="otm_4">OTM-4</option>
-                          <option value="otm_5">OTM-5</option>
-                          <option value="otm_6">OTM-6</option>
-                          <option value="otm_7">OTM-7</option>
-                          <option value="otm_8">OTM-8</option>
-                          <option value="otm_9">OTM-9</option>
-                          <option value="otm_10">OTM-10</option>
-                          <option value="otm_11">OTM-11</option>
-                          <option value="otm_12">OTM-12</option>
-                          <option value="otm_13">OTM-13</option>
-                          <option value="otm_14">OTM-14</option>
-                          <option value="otm_15">OTM-15</option>
-                          <option value="otm_16">OTM-16</option>
-                          <option value="otm_17">OTM-17</option>
-                          <option value="otm_18">OTM-18</option>
-                          <option value="otm_19">OTM-19</option>
-                          <option value="otm_20">OTM-20</option>
-                        </select>
-                      </div>
-                    )}
-
-                    {/* ATM Direction - Only show when Strike Criteria is "Based On ATM %" */}
-                    {lazyLegConfig.strike_criteria === 'based on atm percent' && (
-                      <div className="flex flex-col">
-                        <label className="text-xs font-semibold text-slate-700 mb-1">ATM</label>
-                        <select
-                          value={lazyLegConfig.atm_percent_direction}
-                          onChange={(e) => setLazyLegConfig({...lazyLegConfig, atm_percent_direction: e.target.value})}
-                          className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-                        >
-                          <option value="+">+</option>
-                          <option value="-">-</option>
-                        </select>
-                      </div>
-                    )}
-
-                    {/* ATM Percentage - Only show when Strike Criteria is "Based On ATM %" */}
-                    {lazyLegConfig.strike_criteria === 'based on atm percent' && (
-                      <div className="flex flex-col">
-                        <label className="text-xs font-semibold text-slate-700 mb-1">%</label>
-                        <div className="relative">
-                          <input 
-                            type="number" 
-                            min="0"
-                            step="0.01"
-                            value={lazyLegConfig.atm_percent_value} 
-                            onChange={(e) => setLazyLegConfig({...lazyLegConfig, atm_percent_value: e.target.value})}
-                            onFocus={handleNumberFocus}
-                            className="w-full px-3 py-2 pr-8 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-                            placeholder="0.00"
-                          />
-                          <span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm font-medium text-gray-600">%</span>
-                        </div>
-                      </div>
-                    )}
-
-                    {/* Lower Range - Only show when Strike Criteria is "Based On premium range" */}
-                    {lazyLegConfig.strike_criteria === 'based on premium range' && (
-                      <div className="flex flex-col">
-                        <label className="text-xs font-semibold text-slate-700 mb-1">Lower Range</label>
-                        <input 
-                          type="number" 
-                          value={lazyLegConfig.lower_range} 
-                          onChange={(e) => setLazyLegConfig({...lazyLegConfig, lower_range: e.target.value})}
-                          onFocus={handleNumberFocus}
-                          className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-                          placeholder="0.00"
-                          step="0.01"
-                        />
-                      </div>
-                    )}
-
-                    {/* Upper Range - Only show when Strike Criteria is "Based On premium range" */}
-                    {lazyLegConfig.strike_criteria === 'based on premium range' && (
-                      <div className="flex flex-col">
-                        <label className="text-xs font-semibold text-slate-700 mb-1">Upper Range</label>
-                        <input 
-                          type="number" 
-                          value={lazyLegConfig.upper_range} 
-                          onChange={(e) => setLazyLegConfig({...lazyLegConfig, upper_range: e.target.value})}
-                          onFocus={handleNumberFocus}
-                          className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-                          placeholder="0.00"
-                          step="0.01"
-                        />
-                      </div>
-                    )}
-
-                    {/* Nearest - Only show when Strike Criteria is "Based On Closest Premium" */}
-                    {lazyLegConfig.strike_criteria === 'closest premium' && (
-                      <div className="flex flex-col">
-                        <label className="text-xs font-semibold text-slate-700 mb-1">Nearest</label>
-                        <input 
-                          type="number" 
-                          min="0"
-                          step="0.01"
-                          value={lazyLegConfig.closest_premium_value} 
-                          onChange={(e) => setLazyLegConfig({...lazyLegConfig, closest_premium_value: e.target.value})}
-                          onFocus={handleNumberFocus}
-                          className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-                          placeholder="0.00"
-                        />
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Row 3: Target / Stop Loss / Trail SL */}
-                  <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-17">
-                    {/* Target */}
-                    <div className="flex flex-col">
-                      <div className="flex items-center gap-2 mb-1">
-                        <label className="text-xs font-semibold text-slate-700">Target</label>
-                        <ToggleSwitch 
-                          checked={lazyLegConfig.target_enabled} 
-                          onChange={(e) => setLazyLegConfig({...lazyLegConfig, target_enabled: e.target.checked})} 
-                        />
-                      </div>
-                      <div className="flex gap-2">
-                        <select 
-                          value={lazyLegConfig.target_type} 
-                          onChange={(e) => setLazyLegConfig({...lazyLegConfig, target_type: e.target.value})} 
-                          disabled={!lazyLegConfig.target_enabled}
-                          className="flex-1 px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                        >
-                          <option value="points">Points</option>
-                          <option value="percentage">Percentage</option>
-                          <option value="underlying_points">Underlying Points</option>
-                          <option value="underlying_percentage">Underlying Percentage</option>
-                        </select>
-                        <input 
-                          type="number" 
-                          value={lazyLegConfig.target_value} 
-                          onChange={(e) => setLazyLegConfig({...lazyLegConfig, target_value: e.target.value})}
-                          onFocus={handleNumberFocus}
-                          disabled={!lazyLegConfig.target_enabled}
-                          className="w-20 px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                          placeholder="0.00"
-                          step="0.01"
-                        />
-                      </div>
-                    </div>
-
-                    {/* Stop Loss */}
-                    <div className="flex flex-col">
-                      <div className="flex items-center gap-2 mb-1">
-                        <label className="text-xs font-semibold text-slate-700">Stop Loss</label>
-                        <ToggleSwitch 
-                          checked={lazyLegConfig.stop_loss_enabled} 
-                          onChange={(e) => setLazyLegConfig({...lazyLegConfig, stop_loss_enabled: e.target.checked})} 
-                        />
-                      </div>
-                      <div className="flex gap-2">
-                        <select 
-                          value={lazyLegConfig.stop_loss_type} 
-                          onChange={(e) => setLazyLegConfig({...lazyLegConfig, stop_loss_type: e.target.value})} 
-                          disabled={!lazyLegConfig.stop_loss_enabled}
-                          className="flex-1 px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                        >
-                          <option value="points">Points</option>
-                          <option value="percentage">Percentage</option>
-                          <option value="underlying_points">Underlying Points</option>
-                          <option value="underlying_percentage">Underlying Percentage</option>
-                        </select>
-                        <input 
-                          type="number" 
-                          value={lazyLegConfig.stop_loss_value} 
-                          onChange={(e) => setLazyLegConfig({...lazyLegConfig, stop_loss_value: e.target.value})}
-                          onFocus={handleNumberFocus}
-                          disabled={!lazyLegConfig.stop_loss_enabled}
-                          className="w-20 px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                          placeholder="0.00"
-                          step="0.01"
-                        />
-                      </div>
-                    </div>
-
-                    {/* Trail SL */}
-                    <div className="flex flex-col">
-                      <div className="flex items-center gap-2 mb-1">
-                        <label className="text-xs font-semibold text-slate-700">Trail SL</label>
-                        <ToggleSwitch 
-                          checked={lazyLegConfig.trail_sl_enabled} 
-                          onChange={(e) => setLazyLegConfig({...lazyLegConfig, trail_sl_enabled: e.target.checked})} 
-                        />
-                      </div>
-                      <div className="flex gap-1">
-                        <select 
-                          value={lazyLegConfig.trail_sl_type} 
-                          onChange={(e) => setLazyLegConfig({...lazyLegConfig, trail_sl_type: e.target.value})} 
-                          disabled={!lazyLegConfig.trail_sl_enabled}
-                          className="flex-1 min-w-0 px-2 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                        >
-                          <option value="points">Points</option>
-                          <option value="percentage">Percentage</option>
-                        </select>
-                        <input 
-                          type="number" 
-                          value={lazyLegConfig.trail_sl_value} 
-                          onChange={(e) => setLazyLegConfig({...lazyLegConfig, trail_sl_value: e.target.value})}
-                          onFocus={handleNumberFocus}
-                          disabled={!lazyLegConfig.trail_sl_enabled}
-                          className="flex-1 min-w-0 px-2 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                          placeholder="0.00"
-                          step="0.01"
-                        />
-                        <input 
-                          type="number" 
-                          value={lazyLegConfig.trail_sl_lock_value} 
-                          onChange={(e) => setLazyLegConfig({...lazyLegConfig, trail_sl_lock_value: e.target.value})}
-                          onFocus={handleNumberFocus}
-                          disabled={!lazyLegConfig.trail_sl_enabled}
-                          className="flex-1 min-w-0 px-2 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                          placeholder="0.00"
-                          step="0.01"
-                        />
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Row 4: Re-Entry Options */}
-                  <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-17">
-                    {/* Re-Entry On Target */}
-                    <div className="flex flex-col">
-                      <div className="flex items-center gap-2 mb-1">
-                        <label className="text-xs font-semibold text-slate-700">Re-Entry On Target</label>
-                        <ToggleSwitch 
-                          checked={lazyLegConfig.reentry_tgt_enabled} 
-                          onChange={(e) => setLazyLegConfig({...lazyLegConfig, reentry_tgt_enabled: e.target.checked})} 
-                        />
-                      </div>
-                      <div className="flex gap-2">
-                        <select 
-                          value={lazyLegConfig.reentry_tgt_mode} 
-                          onChange={(e) => setLazyLegConfig({...lazyLegConfig, reentry_tgt_mode: e.target.value})} 
-                          disabled={!lazyLegConfig.reentry_tgt_enabled}
-                          className="flex-1 px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                        >
-                          <option value="re_cost">RE COST</option>
-                          <option value="re_asap">RE ASAP</option>
-                          <option value="re_asap_rev">RE ASAP REV</option>
-                          <option value="re_momentum">RE MOMENTUM</option>
-                          <option value="re_momentum_rev">RE MOMENTUM REV</option>
-                          <option value="re_cost_rev">RE COST REV</option>
-                          <option value="lazy_leg">Lazy Leg</option>
-                        </select>
-                        <input 
-                          type="number" 
-                          value={lazyLegConfig.reentry_tgt_count} 
-                          onChange={(e) => setLazyLegConfig({...lazyLegConfig, reentry_tgt_count: e.target.value})}
-                          onFocus={handleNumberFocus}
-                          disabled={!lazyLegConfig.reentry_tgt_enabled}
-                          className="w-16 px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                          placeholder="1.00"
-                          min="1"
-                        />
-                      </div>
-                    </div>
-
-                    {/* Re-Entry On SL */}
-                    <div className="flex flex-col">
-                      <div className="flex items-center gap-2 mb-1">
-                        <label className="text-xs font-semibold text-slate-700">Re-Entry On SL</label>
-                        <ToggleSwitch 
-                          checked={lazyLegConfig.reentry_sl_enabled} 
-                          onChange={(e) => setLazyLegConfig({...lazyLegConfig, reentry_sl_enabled: e.target.checked})} 
-                        />
-                      </div>
-                      <div className="flex gap-2">
-                        <select 
-                          value={lazyLegConfig.reentry_sl_mode} 
-                          onChange={(e) => setLazyLegConfig({...lazyLegConfig, reentry_sl_mode: e.target.value})} 
-                          disabled={!lazyLegConfig.reentry_sl_enabled}
-                          className="flex-1 px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                        >
-                          <option value="re_cost">RE COST</option>
-                          <option value="re_asap">RE ASAP</option>
-                          <option value="re_asap_rev">RE ASAP REV</option>
-                          <option value="re_momentum">RE MOMENTUM</option>
-                          <option value="re_momentum_rev">RE MOMENTUM REV</option>
-                          <option value="re_cost_rev">RE COST REV</option>
-                          <option value="lazy_leg">Lazy Leg</option>
-                        </select>
-                        <input 
-                          type="number" 
-                          value={lazyLegConfig.reentry_sl_count} 
-                          onChange={(e) => setLazyLegConfig({...lazyLegConfig, reentry_sl_count: e.target.value})}
-                          onFocus={handleNumberFocus}
-                          disabled={!lazyLegConfig.reentry_sl_enabled}
-                          className="w-16 px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                          placeholder="1.00"
-                          min="1"
-                        />
-                      </div>
-                    </div>
-
-                    {/* Simple Momentum */}
-                    <div className="flex flex-col">
-                      <div className="flex items-center gap-2 mb-1">
-                        <label className="text-xs font-semibold text-slate-700">Simple Momentum</label>
-                        <ToggleSwitch 
-                          checked={lazyLegConfig.momentum_enabled} 
-                          onChange={(e) => setLazyLegConfig({...lazyLegConfig, momentum_enabled: e.target.checked})} 
-                        />
-                      </div>
-                      <div className="flex gap-2">
-                        <select 
-                          value={lazyLegConfig.momentum_type} 
-                          onChange={(e) => setLazyLegConfig({...lazyLegConfig, momentum_type: e.target.value})} 
-                          disabled={!lazyLegConfig.momentum_enabled}
-                          className="flex-1 px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                        >
-                          <option value="points_up">Points ↑</option>
-                          <option value="points_down">Points ↓</option>
-                          <option value="percent_up">Percent ↑</option>
-                          <option value="percent_down">Percent ↓</option>
-                          <option value="underlying_points_up">Underlying Points ↑</option>
-                          <option value="underlying_points_down">Underlying Points ↓</option>
-                          <option value="underlying_percent_up">Underlying Percent ↑</option>
-                          <option value="underlying_percent_down">Underlying Percent ↓</option>
-                        </select>
-                        <input 
-                          type="number" 
-                          value={lazyLegConfig.momentum_value} 
-                          onChange={(e) => setLazyLegConfig({...lazyLegConfig, momentum_value: e.target.value})}
-                          onFocus={handleNumberFocus}
-                          disabled={!lazyLegConfig.momentum_enabled}
-                          className="w-20 px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                          placeholder="0.00"
-                          step="0.01"
-                        />
-                      </div>
-                    </div>
-                  </div>
-
-                </div>
-              </div>
-            </div>
-            
-            {/* Modal Footer */}
-            <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-gray-200 bg-gray-50 sticky bottom-0">
-              <button
-                onClick={() => {
-                  setShowLazyLegModal(false);
-                  setLazyLegContext(null);
-                }}
-                className="px-6 py-2 text-gray-700 hover:text-gray-900 font-medium transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={createLazyLeg}
-                className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium transition-all shadow-sm"
-              >
-                Create
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Sequential Leg Configuration Modal */}
-      {showSequentialLegModal && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-lg shadow-2xl w-full max-w-7xl max-h-[95vh] overflow-hidden flex flex-col">
-            {/* Modal Header */}
-            <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200 bg-white sticky top-0 z-10">
-              <div>
-                <h2 className="text-xl font-semibold text-gray-800">
-                  Create Sequential Leg for {sequentialLegParentIndex !== null ? `LEG#${sequentialLegParentIndex + 1}` : 'LEG'}
-                </h2>
-                <p className="text-xs text-gray-500 mt-1">Configure a sequential leg that will be created when entry condition is met</p>
-              </div>
-              <button
-                onClick={() => {
-                  setShowSequentialLegModal(false);
-                  setSequentialLegParentIndex(null);
-                }}
-                className="text-gray-400 hover:text-gray-600 transition-colors"
-              >
-                <X size={24} />
-              </button>
-            </div>
-
-            {/* Modal Body - Scrollable Content - FULL LEG BUILDER */}
-            <div className="flex-1 overflow-y-auto">
-              {/* Name Input Section - Matching Lazy Leg Style */}
-              <div className="px-6 py-4 bg-gray-50 border-b border-gray-200">
-                <label className="block text-sm font-semibold text-gray-700 mb-2">Enter Leg Name</label>
-                <input
-                  type="text"
-                  value={sequentialLegConfig.customName}
-                  onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, customName: e.target.value})}
-                  placeholder="SEQ1"
-                  className="w-64 px-4 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-                />
-              </div>
-              
-              {/* LEG BUILDER REPLICA - Exact same layout as in the main component */}
-              <div className="w-full bg-white rounded-lg shadow-xl border border-white overflow-hidden animate-fade-in">
-                {/* Content */}
-                <div className="space-y-8" style={{ paddingLeft: '25px', paddingRight: '25px', paddingTop: '26px', paddingBottom: '26px' }}>
-
-                {/* Row 1: Total Lot / Expiry / Position / Option Type */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-17">
-                  {/* Total Lot */}
+              <div className="border rounded-lg px-6 py-6" style={{ borderColor: colors.settingsPanel.cardBorder }}>
+                {/* Row 1 */}
+                <div className="flex flex-wrap items-end justify-center gap-x-6 gap-y-4">
                   <div className="flex flex-col">
-                    <label className="text-xs font-semibold text-slate-700 mb-1">Total Lot</label>
-                    <input
-                      type="number"
-                      min="0"
-                      step="1"
-                      value={sequentialLegConfig.lots}
-                      onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, lots: e.target.value})}
-                      className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-                    />
+                    <label className="text-[13px] font-medium text-gray-700 mb-1.5">Lots</label>
+                    <input type="number" min="1" step="1" value={lazyLegConfig.lots} onChange={(e) => { const val = e.target.value; if (val !== '') { if (val.includes('.')) { setResponsePopup({ type: 'error', title: 'Total Lot must be a whole number' }); return; } if (Number(val) < 0) { setResponsePopup({ type: 'error', title: 'Total Lot cannot be negative' }); return; } if (Number(val) === 0) { setResponsePopup({ type: 'error', title: 'Total Lot must be at least 1' }); return; } } setLazyLegConfig(prev => ({ ...prev, lots: val })); }} className="lot-spinner w-24 px-3.5 h-8 text-[13px] font-normal border border-[#e3e3e3] rounded-md bg-white outline-none" style={{ color: colors.settingsPanel.inputValue }} placeholder="1" />
                   </div>
-
-                  {/* Expiry */}
                   <div className="flex flex-col">
-                    <label className="text-xs font-semibold text-slate-700 mb-1">Expiry</label>
-                    <select
-                      value={sequentialLegConfig.expiry}
-                      onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, expiry: e.target.value})}
-                      className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-                    >
-                      <option value="0dte">0DTE</option>
-                      <option value="weekly">Weekly</option>
-                      <option value="monthly">Monthly</option>
+                    <label className="text-[13px] font-medium text-gray-700 mb-1.5">Position</label>
+                    <select value={lazyLegConfig.position} onChange={(e) => setLazyLegConfig(prev => ({ ...prev, position: e.target.value }))} className="appearance-none w-[5.75rem] px-3.5 pr-8 h-8 text-[13px] font-normal border rounded-md outline-none cursor-pointer" style={{ backgroundColor: colors.dropdownPlain.background, borderColor: colors.settingsPanel.fieldBorder, color: colors.settingsPanel.inputValue, backgroundImage: selectChevron('%234B5563'), backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.6rem center' }}>
+                      <option value="buy">Buy</option>
+                      <option value="sell">Sell</option>
                     </select>
                   </div>
-
-                  {/* Position */}
                   <div className="flex flex-col">
-                    <label className="text-xs font-semibold text-slate-700 mb-1">Position</label>
-                    <div className="flex gap-2">
-                      <button
-                        onClick={() => setSequentialLegConfig({...sequentialLegConfig, position: 'buy'})}
-                        className={`flex-1 px-3 py-2 rounded-lg text-sm font-semibold transition-all ${
-                          sequentialLegConfig.position === 'buy'
-                            ? 'text-white shadow-md'
-                            : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                        }`}
-                        style={sequentialLegConfig.position === 'buy' ? { backgroundColor: '#4682b4' } : {}}
-                      >
-                        Buy
-                      </button>
-                      <button
-                        onClick={() => setSequentialLegConfig({...sequentialLegConfig, position: 'sell'})}
-                        className={`flex-1 px-3 py-2 rounded-lg text-sm font-semibold transition-all ${
-                          sequentialLegConfig.position === 'sell'
-                            ? 'text-white shadow-md'
-                            : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                        }`}
-                        style={sequentialLegConfig.position === 'sell' ? { backgroundColor: '#4682b4' } : {}}
-                      >
-                        Sell
-                      </button>
-                    </div>
+                    <label className="text-[13px] font-medium text-gray-700 mb-1.5">Option Type</label>
+                    <select value={lazyLegConfig.option_type} onChange={(e) => setLazyLegConfig(prev => ({ ...prev, option_type: e.target.value }))} className="appearance-none w-[5.75rem] px-3.5 pr-8 h-8 text-[13px] font-normal border rounded-md outline-none cursor-pointer" style={{ backgroundColor: colors.dropdownPlain.background, borderColor: colors.settingsPanel.fieldBorder, color: colors.settingsPanel.inputValue, backgroundImage: selectChevron('%234B5563'), backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.6rem center' }}>
+                      <option value="call">Call</option>
+                      <option value="put">Put</option>
+                    </select>
                   </div>
-
-                  {/* Option Type */}
                   <div className="flex flex-col">
-                    <label className="text-xs font-semibold text-slate-700 mb-1">Option Type</label>
-                    <div className="flex gap-2">
-                      <button
-                        onClick={() => setSequentialLegConfig({...sequentialLegConfig, option_type: 'call'})}
-                        className={`flex-1 px-3 py-2 rounded-lg text-sm font-semibold transition-all ${
-                          sequentialLegConfig.option_type === 'call'
-                            ? 'text-white shadow-md'
-                            : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                        }`}
-                        style={sequentialLegConfig.option_type === 'call' ? { backgroundColor: '#4682b4' } : {}}
-                      >
-                        Call
-                      </button>
-                      <button
-                        onClick={() => setSequentialLegConfig({...sequentialLegConfig, option_type: 'put'})}
-                        className={`flex-1 px-3 py-2 rounded-lg text-sm font-semibold transition-all ${
-                          sequentialLegConfig.option_type === 'put'
-                            ? 'text-white shadow-md'
-                            : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                        }`}
-                        style={sequentialLegConfig.option_type === 'put' ? { backgroundColor: '#4682b4' } : {}}
-                      >
-                        Put
-                      </button>
-                    </div>
+                    <label className="text-[13px] font-medium text-gray-700 mb-1.5">Expiry</label>
+                    <select value={lazyLegConfig.expiry} onChange={(e) => { warnIfWeeklyLegExpiry(e.target.value); setLazyLegConfig(prev => ({ ...prev, expiry: e.target.value })); }} className="appearance-none w-[9.5rem] px-3.5 pr-8 h-8 text-[13px] font-normal border rounded-md outline-none cursor-pointer" style={{ backgroundColor: colors.dropdownPlain.background, borderColor: colors.settingsPanel.fieldBorder, color: colors.settingsPanel.inputValue, backgroundImage: selectChevron('%234B5563'), backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.6rem center' }}>
+                      <option value="weekly">Weekly</option>
+                      <option value="next_weekly">Next Weekly</option>
+                      <option value="monthly">Monthly</option>
+                      <option value="next_monthly">Next Monthly</option>
+                    </select>
                   </div>
-                </div>
-
-                {/* Row 2: Strike Criteria - ALL FIELDS IN ONE LINE (like intraday main leg) */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-17">
-                  {/* Strike Criteria */}
                   <div className="flex flex-col">
-                    <label className="text-xs font-semibold text-slate-700 mb-1">Strike Criteria</label>
-                    <select
-                      value={sequentialLegConfig.strike_criteria}
-                      onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, strike_criteria: e.target.value})}
-                      className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-                    >
+                    <label className="text-[13px] font-medium text-gray-700 mb-1.5 flex items-center gap-1">
+                      Select Strike Criteria
+                      <Info size={12} className="text-gray-400" />
+                    </label>
+                    <select value={lazyLegConfig.strike_criteria} onChange={(e) => setLazyLegConfig(prev => ({ ...prev, strike_criteria: e.target.value }))} className="appearance-none w-[15rem] px-3.5 pr-8 h-8 text-[13px] font-normal border rounded-md outline-none cursor-pointer" style={{ backgroundColor: colors.dropdownPlain.background, borderColor: colors.settingsPanel.fieldBorder, color: colors.settingsPanel.inputValue, backgroundImage: selectChevron('%234B5563'), backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.6rem center' }}>
                       <option value="based on points">Based On Strike</option>
                       <option value="based on atm percent">Based On ATM %</option>
                       <option value="based on premium range">Based On premium range</option>
                       <option value="closest premium">Based On Closest Premium</option>
                     </select>
                   </div>
-
-                  {/* ATM Strike - Only show when "Based On Strike" is selected */}
-                  {sequentialLegConfig.strike_criteria === 'based on points' && (
-                    <div className="flex flex-col">
-                      <label className="text-xs font-semibold text-slate-700 mb-1">ATM Strike</label>
-                      <select
-                        value={sequentialLegConfig.atm_strike || 'atm'}
-                        onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, atm_strike: e.target.value})}
-                        className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-                      >
-                        <option value="itm_20">ITM-20</option>
-                        <option value="itm_19">ITM-19</option>
-                        <option value="itm_18">ITM-18</option>
-                        <option value="itm_17">ITM-17</option>
-                        <option value="itm_16">ITM-16</option>
-                        <option value="itm_15">ITM-15</option>
-                        <option value="itm_14">ITM-14</option>
-                        <option value="itm_13">ITM-13</option>
-                        <option value="itm_12">ITM-12</option>
-                        <option value="itm_11">ITM-11</option>
-                        <option value="itm_10">ITM-10</option>
-                        <option value="itm_9">ITM-9</option>
-                        <option value="itm_8">ITM-8</option>
-                        <option value="itm_7">ITM-7</option>
-                        <option value="itm_6">ITM-6</option>
-                        <option value="itm_5">ITM-5</option>
-                        <option value="itm_4">ITM-4</option>
-                        <option value="itm_3">ITM-3</option>
-                        <option value="itm_2">ITM-2</option>
-                        <option value="itm_1">ITM-1</option>
-                        <option value="atm">ATM</option>
-                        <option value="otm_1">OTM-1</option>
-                        <option value="otm_2">OTM-2</option>
-                        <option value="otm_3">OTM-3</option>
-                        <option value="otm_4">OTM-4</option>
-                        <option value="otm_5">OTM-5</option>
-                        <option value="otm_6">OTM-6</option>
-                        <option value="otm_7">OTM-7</option>
-                        <option value="otm_8">OTM-8</option>
-                        <option value="otm_9">OTM-9</option>
-                        <option value="otm_10">OTM-10</option>
-                        <option value="otm_11">OTM-11</option>
-                        <option value="otm_12">OTM-12</option>
-                        <option value="otm_13">OTM-13</option>
-                        <option value="otm_14">OTM-14</option>
-                        <option value="otm_15">OTM-15</option>
-                        <option value="otm_16">OTM-16</option>
-                        <option value="otm_17">OTM-17</option>
-                        <option value="otm_18">OTM-18</option>
-                        <option value="otm_19">OTM-19</option>
-                        <option value="otm_20">OTM-20</option>
+                  {lazyLegConfig.strike_criteria === 'based on points' && (
+                    <div className="flex flex-col w-[7.5rem]">
+                      <StrikeSelector size="md" value={lazyLegConfig.atm_strike || 'atm'} onChange={(value) => setLazyLegConfig(prev => ({ ...prev, atm_strike: value }))} />
+                    </div>
+                  )}
+                  {lazyLegConfig.strike_criteria === 'based on atm percent' && (
+                    <div className="flex items-center gap-2">
+                      <span className="text-[13px] font-medium text-gray-700">ATM</span>
+                      <select value={lazyLegConfig.atm_percent_direction || '+'} onChange={(e) => setLazyLegConfig(prev => ({ ...prev, atm_percent_direction: e.target.value }))} className="appearance-none w-full pl-3.5 pr-7 h-8 text-[13px] border border-[#e3e3e3] rounded-md font-normal outline-none cursor-pointer" style={{ backgroundColor: colors.dropdownPlain.background, borderColor: colors.settingsPanel.fieldBorder, color: colors.settingsPanel.inputValue, backgroundImage: selectChevron('%234B5563'), backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.6rem center' }}>
+                        <option value="+">+</option>
+                        <option value="-">-</option>
                       </select>
+                      <div className="relative flex items-center">
+                        <input type="number" min="0" step="0.01" value={lazyLegConfig.atm_percent_value ?? ''} onChange={(e) => setLazyLegConfig(prev => ({ ...prev, atm_percent_value: e.target.value }))} className="w-24 pl-3.5 pr-8 h-8 text-[13px] border border-[#e3e3e3] rounded-md bg-white font-normal outline-none" placeholder="0" />
+                        <span className="absolute right-3 text-[13px] font-normal text-gray-700 pointer-events-none">%</span>
+                      </div>
+                      <span className="text-[13px] font-medium text-gray-700 whitespace-nowrap">of ATM</span>
                     </div>
                   )}
-
-                  {/* Nearest - Only show when Based On Closest Premium is selected */}
-                  {sequentialLegConfig.strike_criteria === 'closest premium' && (
+                  {lazyLegConfig.strike_criteria === 'closest premium' && (
                     <div className="flex flex-col">
-                      <label className="text-xs font-semibold text-slate-700 mb-1">Nearest</label>
-                      <input 
-                        type="number" 
-                        min="0"
-                        step="0.01"
-                        value={sequentialLegConfig.strike_value ?? ''} 
-                        onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, strike_value: e.target.value})}
-                        className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-                        placeholder="0.00"
-                      />
+                      <label className="text-[13px] font-medium text-gray-700 mb-1.5">Premium</label>
+                      <input type="number" min="0" step="0.01" value={lazyLegConfig.closest_premium_value ?? ''} onChange={(e) => setLazyLegConfig(prev => ({ ...prev, closest_premium_value: e.target.value }))} className="w-[6.25rem] px-3.5 h-8 text-[13px] border border-[#e3e3e3] rounded-md bg-white font-normal outline-none transition-colors disabled:opacity-40" placeholder="50" />
                     </div>
                   )}
-
-                  {/* ATM % Fields - Only show when "Based On ATM %" is selected */}
-                  {sequentialLegConfig.strike_criteria === 'based on atm percent' && (
+                  {lazyLegConfig.strike_criteria === 'based on premium range' && (
                     <>
                       <div className="flex flex-col">
-                        <label className="text-xs font-semibold text-slate-700 mb-1">ATM Strike</label>
-                        <select
-                          value={sequentialLegConfig.atm_percent_direction || '+'}
-                          onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, atm_percent_direction: e.target.value})}
-                          className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-                        >
-                          <option value="+">+</option>
-                          <option value="-">-</option>
-                        </select>
+                        <label className="text-[13px] font-medium text-gray-700 mb-1.5">Lower</label>
+                        <input type="number" step="0.01" value={lazyLegConfig.lower_range ?? ''} onChange={(e) => setLazyLegConfig(prev => ({ ...prev, lower_range: e.target.value }))} className="w-[6.25rem] px-3.5 h-8 text-[13px] border border-[#e3e3e3] rounded-md bg-white font-normal outline-none transition-colors disabled:opacity-40" placeholder="50" />
                       </div>
                       <div className="flex flex-col">
-                        <label className="text-xs font-semibold text-slate-700 mb-1">Multiplier (%)</label>
-                        <div className="relative">
-                          <input 
-                            type="number" 
-                            min="0"
-                            step="0.01"
-                            value={sequentialLegConfig.atm_percent_value ?? ''} 
-                            onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, atm_percent_value: e.target.value})}
-                            className="w-full px-3 py-2 pr-8 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-                            placeholder="0"
-                          />
-                          <span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm font-medium text-gray-600">%</span>
-                        </div>
-                      </div>
-                    </>
-                  )}
-
-                  {/* Premium Range Fields - Only show when "Based On premium range" is selected */}
-                  {sequentialLegConfig.strike_criteria === 'based on premium range' && (
-                    <>
-                      <div className="flex flex-col">
-                        <label className="text-xs font-semibold text-slate-700 mb-1">Lower Range</label>
-                        <input 
-                          type="number" 
-                          min="0"
-                          step="0.01"
-                          value={sequentialLegConfig.lower_range ?? ''} 
-                          onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, lower_range: e.target.value})}
-                          className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-                          placeholder="0"
-                        />
-                      </div>
-                      <div className="flex flex-col">
-                        <label className="text-xs font-semibold text-slate-700 mb-1">Upper Range</label>
-                        <input 
-                          type="number" 
-                          min="0"
-                          step="0.01"
-                          value={sequentialLegConfig.upper_range ?? ''} 
-                          onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, upper_range: e.target.value})}
-                          className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-                          placeholder="0"
-                        />
+                        <label className="text-[13px] font-medium text-gray-700 mb-1.5">Upper</label>
+                        <input type="number" step="0.01" value={lazyLegConfig.upper_range ?? ''} onChange={(e) => setLazyLegConfig(prev => ({ ...prev, upper_range: e.target.value }))} className="w-[6.25rem] px-3.5 h-8 text-[13px] border border-[#e3e3e3] rounded-md bg-white font-normal outline-none transition-colors disabled:opacity-40" placeholder="100" />
                       </div>
                     </>
                   )}
                 </div>
 
-
-                {/* Row 3: Target / Stop Loss / Trail SL */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-17">
-                  {/* Target */}
-                  <div className="flex flex-col">
-                    <div className="flex items-center gap-2 mb-1">
-                      <label className="text-xs font-semibold text-slate-700">Target</label>
-                      <ToggleSwitch
-                        checked={sequentialLegConfig.target_enabled || false}
-                        onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, target_enabled: e.target.checked})}
-                      />
+                {/* Row 2: Target Profit / Stop Loss / Trail SL */}
+                <div className="modal-field-row flex flex-wrap justify-center items-start gap-x-7 gap-y-5 mt-6">
+                  <div className="flex flex-col space-y-2">
+                    <div className="flex items-center gap-2">
+                      <label className="text-[13px] font-medium text-gray-700">Target Profit</label>
+                      
+                      <ToggleSwitch size="sm" checked={lazyLegConfig.target_enabled || false} onChange={modalTargetToggle(setLazyLegConfig)} id="lazyTargetProfit" />
                     </div>
                     <div className="flex gap-2">
-                      <select
-                        value={sequentialLegConfig.target_type || 'points'}
-                        onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, target_type: e.target.value})}
-                        disabled={!sequentialLegConfig.target_enabled}
-                        className="flex-1 px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                      >
-                        <option value="points">Points</option>
-                        <option value="percentage">Percentage</option>
-                        <option value="underlying_points">Underlying Points</option>
-                        <option value="underlying_percentage">Underlying Percentage</option>
+                      <select style={{ backgroundColor: colors.settingsPanel.activeBg, color: colors.settingsPanel.activeText, borderColor: colors.settingsPanel.activeBg, backgroundImage: selectChevron('white'), backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.6rem center' }} value={lazyLegConfig.target_type || 'points'} onChange={(e) => setLazyLegConfig(prev => ({ ...prev, target_type: e.target.value }))} disabled={!lazyLegConfig.target_enabled} className="appearance-none w-[10.25rem] pl-3.5 pr-8 h-8 text-[13px] border rounded-md font-normal outline-none transition-colors disabled:opacity-40">
+                        <option value="points">Points (Pts)</option>
+                        <option value="underlying_points">Underlying Pts</option>
+                        <option value="percentage">Percent (%)</option>
+                        <option value="underlying_percentage">Underlying %</option>
                       </select>
-                      <input
-                        type="number"
-                        min="0"
-                        step="0.01"
-                        value={sequentialLegConfig.target_enabled ? (sequentialLegConfig.target_value || '') : ''}
-                        onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, target_value: e.target.value})}
-                        disabled={!sequentialLegConfig.target_enabled}
-                        className="w-20 px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                        placeholder="0.00"
-                      />
+                      <input type="number" min="0" step="0.01" value={lazyLegConfig.target_value || ''} onChange={(e) => { const val = e.target.value; if (val !== '' && Number(val) < 0) { setResponsePopup({ type: 'error', title: 'Target value cannot be negative' }); return; } setLazyLegConfig(prev => ({ ...prev, target_value: val })); }} disabled={!lazyLegConfig.target_enabled} className="w-[6.25rem] px-3.5 h-8 text-[13px] border border-[#e3e3e3] rounded-md bg-white font-normal outline-none transition-colors disabled:opacity-40" placeholder="0" />
                     </div>
                   </div>
-
-                  {/* Stop Loss */}
-                  <div className="flex flex-col">
-                    <div className="flex items-center gap-2 mb-1">
-                      <label className="text-xs font-semibold text-slate-700">Stop Loss</label>
-                      <ToggleSwitch
-                        checked={sequentialLegConfig.stop_loss_enabled || false}
-                        onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, stop_loss_enabled: e.target.checked})}
-                      />
+                  <div className="flex flex-col space-y-2">
+                    <div className="flex items-center gap-2">
+                      <label className="text-[13px] font-medium text-gray-700">Stop Loss</label>
+                      
+                      <ToggleSwitch size="sm" checked={lazyLegConfig.stop_loss_enabled || false} onChange={modalStopLossToggle(setLazyLegConfig)} id="lazyStopLoss" />
                     </div>
                     <div className="flex gap-2">
-                      <select
-                        value={sequentialLegConfig.stop_loss_type || 'points'}
-                        onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, stop_loss_type: e.target.value})}
-                        disabled={!sequentialLegConfig.stop_loss_enabled}
-                        className="flex-1 px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                      >
-                        <option value="points">Points</option>
-                        <option value="percentage">Percentage</option>
-                        <option value="underlying_points">Underlying Points</option>
-                        <option value="underlying_percentage">Underlying Percentage</option>
+                      <select style={{ backgroundColor: colors.settingsPanel.activeBg, color: colors.settingsPanel.activeText, borderColor: colors.settingsPanel.activeBg, backgroundImage: selectChevron('white'), backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.6rem center' }} value={lazyLegConfig.stop_loss_type || 'points'} onChange={(e) => setLazyLegConfig(prev => ({ ...prev, stop_loss_type: e.target.value }))} disabled={!lazyLegConfig.stop_loss_enabled} className="appearance-none w-[10.25rem] pl-3.5 pr-8 h-8 text-[13px] border rounded-md font-normal outline-none transition-colors disabled:opacity-40">
+                        <option value="points">Points (Pts)</option>
+                        <option value="underlying_points">Underlying Pts</option>
+                        <option value="percentage">Percent (%)</option>
+                        <option value="underlying_percentage">Underlying %</option>
                       </select>
-                      <input
-                        type="number"
-                        min="0"
-                        step="0.01"
-                        value={sequentialLegConfig.stop_loss_enabled ? (sequentialLegConfig.stop_loss_value || '') : ''}
-                        onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, stop_loss_value: e.target.value})}
-                        disabled={!sequentialLegConfig.stop_loss_enabled}
-                        className="w-20 px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                        placeholder="0.00"
-                      />
+                      <input type="number" min="0" step="0.01" value={lazyLegConfig.stop_loss_value || ''} onChange={(e) => { const val = e.target.value; if (val !== '' && Number(val) < 0) { setResponsePopup({ type: 'error', title: 'Stop Loss value cannot be negative' }); return; } setLazyLegConfig(prev => ({ ...prev, stop_loss_value: val })); }} disabled={!lazyLegConfig.stop_loss_enabled} className="w-[6.25rem] px-3.5 h-8 text-[13px] border border-[#e3e3e3] rounded-md bg-white font-normal outline-none transition-colors disabled:opacity-40" placeholder="0" />
                     </div>
                   </div>
-
-                  {/* Trail SL */}
-                  <div className="flex flex-col">
-                    <div className="flex items-center gap-2 mb-1">
-                      <label className="text-xs font-semibold text-slate-700">Trail SL</label>
-                      <ToggleSwitch
-                        checked={sequentialLegConfig.trail_sl_enabled || false}
-                        onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, trail_sl_enabled: e.target.checked})}
-                      />
+                  <div className="flex flex-col space-y-2">
+                    <div className="flex items-center gap-2">
+                      <label className="text-[13px] font-medium text-gray-700">Trail SL</label>
+                      <Info size={14} className="text-gray-400" />
+                      <ToggleSwitch size="sm" checked={lazyLegConfig.trail_sl_enabled || false} onChange={(e) => { if (e.target.checked && !modalStopLossReady(lazyLegConfig)) return; setLazyLegConfig(prev => ({ ...prev, trail_sl_enabled: e.target.checked })); }} id="lazyTrailSL" />
                     </div>
-                    <div className="flex gap-1">
-                      <select
-                        value={sequentialLegConfig.trail_sl_type || 'points'}
-                        onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, trail_sl_type: e.target.value})}
-                        disabled={!sequentialLegConfig.trail_sl_enabled}
-                        className="flex-1 min-w-0 px-2 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                      >
+                    <div className="flex gap-2">
+                      <select style={{ backgroundColor: colors.settingsPanel.activeBg, color: colors.settingsPanel.activeText, borderColor: colors.settingsPanel.activeBg, backgroundImage: selectChevron('white'), backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.6rem center' }} value={lazyLegConfig.trail_sl_type || 'points'} onChange={(e) => setLazyLegConfig(prev => ({ ...prev, trail_sl_type: e.target.value }))} disabled={!lazyLegConfig.trail_sl_enabled} className="appearance-none w-36 pl-3.5 pr-8 h-8 text-[13px] border rounded-md font-normal outline-none transition-colors disabled:opacity-40">
                         <option value="points">Points</option>
                         <option value="percentage">Percentage</option>
                       </select>
-                      <input
-                        type="number"
-                        min="0"
-                        step="0.01"
-                        value={sequentialLegConfig.trail_sl_enabled ? (sequentialLegConfig.trail_sl_value || '') : ''}
-                        onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, trail_sl_value: e.target.value})}
-                        disabled={!sequentialLegConfig.trail_sl_enabled}
-                        className="flex-1 min-w-0 px-2 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                        placeholder="0.00"
-                      />
-                      <input
-                        type="number"
-                        min="0"
-                        step="0.01"
-                        value={sequentialLegConfig.trail_sl_enabled ? (sequentialLegConfig.trail_sl_lock_value || '') : ''}
-                        onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, trail_sl_lock_value: e.target.value})}
-                        disabled={!sequentialLegConfig.trail_sl_enabled}
-                        className="flex-1 min-w-0 px-2 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                        placeholder="0.00"
-                      />
+                      <input type="number" min="0" step="0.01" value={lazyLegConfig.trail_sl_value || ''} onChange={(e) => setLazyLegConfig(prev => ({ ...prev, trail_sl_value: e.target.value }))} disabled={!lazyLegConfig.trail_sl_enabled} className="w-[5.5rem] px-3.5 h-8 text-[13px] border border-[#e3e3e3] rounded-md bg-white font-normal outline-none transition-colors disabled:opacity-40" placeholder="0" />
+                      <input type="number" min="0" step="0.01" value={lazyLegConfig.trail_sl_lock_value || ''} onChange={(e) => setLazyLegConfig(prev => ({ ...prev, trail_sl_lock_value: e.target.value }))} disabled={!lazyLegConfig.trail_sl_enabled} className="w-[5.5rem] px-3.5 h-8 text-[13px] border border-[#e3e3e3] rounded-md bg-white font-normal outline-none transition-colors disabled:opacity-40" placeholder="0" />
                     </div>
                   </div>
                 </div>
 
-                {/* Row 4: Re-Entry On Target / Re-Entry On SL / Simple Momentum */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-17">
-                  {/* Re-Entry On Target */}
-                  <div className="flex flex-col">
-                    <div className="flex items-center gap-2 mb-1">
-                      <label className="text-xs font-semibold text-slate-700">Re-Entry On Target</label>
-                      <ToggleSwitch
-                        checked={sequentialLegConfig.reentry_tgt_enabled || false}
-                        onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, reentry_tgt_enabled: e.target.checked})}
-                      />
+                {/* Row 3: Re-entries / Momentum */}
+                <div className="modal-field-row flex flex-wrap justify-center items-start gap-x-7 gap-y-5 mt-6">
+                  <div className="flex flex-col space-y-2">
+                    <div className="flex items-center gap-2">
+                      <label className="text-[13px] font-medium text-gray-700">Re-entry on Tgt</label>
+                      <Info size={14} className="text-gray-400" />
+                      <ToggleSwitch size="sm" checked={lazyLegConfig.reentry_tgt_enabled || false} onChange={(e) => { if (e.target.checked && !modalTargetReady(lazyLegConfig)) return; setLazyLegConfig(prev => ({ ...prev, reentry_tgt_enabled: e.target.checked })); }} id="lazyReentryTgt" />
                     </div>
                     <div className="flex gap-2">
-                      <select
-                        value={sequentialLegConfig.reentry_tgt_mode || 're_cost'}
-                        onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, reentry_tgt_mode: e.target.value})}
-                        disabled={!sequentialLegConfig.reentry_tgt_enabled}
-                        className="flex-1 px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                      >
-                        <option value="re_cost">RE COST</option>
+                      <select style={{ backgroundColor: colors.settingsPanel.activeBg, color: colors.settingsPanel.activeText, borderColor: colors.settingsPanel.activeBg, backgroundImage: selectChevron('white'), backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.6rem center' }} value={lazyLegConfig.reentry_tgt_mode || 're_asap'} onChange={(e) => setLazyLegConfig(prev => ({ ...prev, reentry_tgt_mode: e.target.value }))} disabled={!lazyLegConfig.reentry_tgt_enabled} className="appearance-none w-40 pl-3.5 pr-8 h-8 text-[13px] border rounded-md font-normal outline-none transition-colors disabled:opacity-40">
                         <option value="re_asap">RE ASAP</option>
-                        <option value="re_asap_rev">RE ASAP REV</option>
-                        <option value="re_momentum">RE MOMENTUM</option>
-                        <option value="re_momentum_rev">RE MOMENTUM REV</option>
-                        <option value="re_cost_rev">RE COST REV</option>
-                      </select>
-                      <input
-                        type="number"
-                        min="0"
-                        step="0.01"
-                        value={sequentialLegConfig.reentry_tgt_enabled ? (sequentialLegConfig.reentry_tgt_count || '') : ''}
-                        onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, reentry_tgt_count: e.target.value})}
-                        disabled={!sequentialLegConfig.reentry_tgt_enabled}
-                        className="w-20 px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                        placeholder="1.00"
-                      />
-                    </div>
-                  </div>
-
-                  {/* Re-Entry On SL */}
-                  <div className="flex flex-col">
-                    <div className="flex items-center gap-2 mb-1">
-                      <label className="text-xs font-semibold text-slate-700">Re-Entry On SL</label>
-                      <ToggleSwitch
-                        checked={sequentialLegConfig.reentry_sl_enabled || false}
-                        onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, reentry_sl_enabled: e.target.checked})}
-                      />
-                    </div>
-                    <div className="flex gap-2">
-                      <select
-                        value={sequentialLegConfig.reentry_sl_mode || 're_cost'}
-                        onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, reentry_sl_mode: e.target.value})}
-                        disabled={!sequentialLegConfig.reentry_sl_enabled}
-                        className="flex-1 px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                      >
+                        <option value="re_asap_reverse">RE ASAP ↩</option>
+                        <option value="re_momentum" disabled={!lazyLegConfig.momentum_enabled}>RE MOMENTUM</option>
+                        <option value="re_momentum_reverse" disabled={!lazyLegConfig.momentum_enabled}>RE MOMENTUM ↩</option>
                         <option value="re_cost">RE COST</option>
-                        <option value="re_asap">RE ASAP</option>
-                        <option value="re_asap_rev">RE ASAP REV</option>
-                        <option value="re_momentum">RE MOMENTUM</option>
-                        <option value="re_momentum_rev">RE MOMENTUM REV</option>
-                        <option value="re_cost_rev">RE COST REV</option>
+                        <option value="re_cost_reverse">RE COST ↩</option>
                       </select>
-                      <input
-                        type="number"
-                        min="0"
-                        step="0.01"
-                        value={sequentialLegConfig.reentry_sl_enabled ? (sequentialLegConfig.reentry_sl_count || '') : ''}
-                        onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, reentry_sl_count: e.target.value})}
-                        disabled={!sequentialLegConfig.reentry_sl_enabled}
-                        className="w-20 px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                        placeholder="1.00"
-                      />
+                      <ReentryCountDropdown value={lazyLegConfig.reentry_tgt_count} onChange={(v) => setLazyLegConfig(prev => ({ ...prev, reentry_tgt_count: v }))} disabled={!lazyLegConfig.reentry_tgt_enabled} heightClass="h-8" />
                     </div>
                   </div>
-
-                  {/* Simple Momentum */}
-                  <div className="flex flex-col">
-                    <div className="flex items-center gap-2 mb-1">
-                      <label className="text-xs font-semibold text-slate-700">Simple Momentum</label>
-                      <ToggleSwitch
-                        checked={sequentialLegConfig.momentum_enabled || false}
-                        onChange={(e) => {
-                          if (e.target.checked && sequentialLegConfig.range_breakout_enabled) {
-                            setResponsePopup({
-                              type: 'error',
-                              title: 'Please disable Range Break Out first.'
-                            });
-                            return;
-                          }
-                          setSequentialLegConfig({...sequentialLegConfig, momentum_enabled: e.target.checked});
-                        }}
-                      />
+                  <div className="flex flex-col space-y-2">
+                    <div className="flex items-center gap-2">
+                      <label className="text-[13px] font-medium text-gray-700">Re-entry on SL</label>
+                      <Info size={14} className="text-gray-400" />
+                      <ToggleSwitch size="sm" checked={lazyLegConfig.reentry_sl_enabled || false} onChange={(e) => { if (e.target.checked && !modalStopLossReady(lazyLegConfig)) return; setLazyLegConfig(prev => ({ ...prev, reentry_sl_enabled: e.target.checked })); }} id="lazyReentrySL" />
                     </div>
                     <div className="flex gap-2">
-                      <select
-                        value={sequentialLegConfig.momentum_type || 'points'}
-                        onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, momentum_type: e.target.value})}
-                        disabled={!sequentialLegConfig.momentum_enabled}
-                        className="flex-1 px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                      >
-                        <option value="points">Points ↑</option>
-                        <option value="points_down">Points ↓</option>
-                        <option value="percentage">Percent ↑</option>
-                        <option value="percentage_down">Percent ↓</option>
+                      <select style={{ backgroundColor: colors.settingsPanel.activeBg, color: colors.settingsPanel.activeText, borderColor: colors.settingsPanel.activeBg, backgroundImage: selectChevron('white'), backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.6rem center' }} value={lazyLegConfig.reentry_sl_mode || 're_asap'} onChange={(e) => setLazyLegConfig(prev => ({ ...prev, reentry_sl_mode: e.target.value }))} disabled={!lazyLegConfig.reentry_sl_enabled} className="appearance-none w-40 pl-3.5 pr-8 h-8 text-[13px] border rounded-md font-normal outline-none transition-colors disabled:opacity-40">
+                        <option value="re_asap">RE ASAP</option>
+                        <option value="re_asap_reverse">RE ASAP ↩</option>
+                        <option value="re_momentum" disabled={!lazyLegConfig.momentum_enabled}>RE MOMENTUM</option>
+                        <option value="re_momentum_reverse" disabled={!lazyLegConfig.momentum_enabled}>RE MOMENTUM ↩</option>
+                        <option value="re_cost">RE COST</option>
+                        <option value="re_cost_reverse">RE COST ↩</option>
                       </select>
-                      <input
-                        type="number"
-                        min="0"
-                        step="0.01"
-                        value={sequentialLegConfig.momentum_enabled ? (sequentialLegConfig.momentum_value || '') : ''}
-                        onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, momentum_value: e.target.value})}
-                        disabled={!sequentialLegConfig.momentum_enabled}
-                        className="w-24 px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                        placeholder="0.00"
-                      />
+                      <ReentryCountDropdown value={lazyLegConfig.reentry_sl_count} onChange={(v) => setLazyLegConfig(prev => ({ ...prev, reentry_sl_count: v }))} disabled={!lazyLegConfig.reentry_sl_enabled} heightClass="h-8" />
+                    </div>
+                  </div>
+                  <div className="flex flex-col space-y-2">
+                    <div className="flex items-center gap-2">
+                      <label className="text-[13px] font-medium text-gray-700">Simple Momentum</label>
+                      <Info size={14} className="text-gray-400" />
+                      <ToggleSwitch size="sm" checked={lazyLegConfig.momentum_enabled || false} onChange={(e) => setLazyLegConfig(prev => ({ ...prev, momentum_enabled: e.target.checked }))} id="lazyMomentum" />
+                    </div>
+                    <div className="flex gap-2">
+                      <select style={{ backgroundColor: colors.settingsPanel.activeBg, color: colors.settingsPanel.activeText, borderColor: colors.settingsPanel.activeBg, backgroundImage: selectChevron('white'), backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.6rem center' }} value={lazyLegConfig.momentum_type || 'points'} onChange={(e) => setLazyLegConfig(prev => ({ ...prev, momentum_type: e.target.value }))} disabled={!lazyLegConfig.momentum_enabled} className="appearance-none w-[11rem] pl-3.5 pr-8 h-8 text-[13px] border rounded-md font-normal outline-none transition-colors disabled:opacity-40">
+                        <option value="points">Points (Pts) ↑</option>
+                        <option value="points_down">Points (Pts) ↓</option>
+                        <option value="percentage">Percent (%) ↑</option>
+                        <option value="percentage_down">Percent (%) ↓</option>
+                        <option value="underlying_points_up">Underlying Pts ↑</option>
+                        <option value="underlying_points_down">Underlying Pts ↓</option>
+                        <option value="underlying_percentage_up">Underlying % ↑</option>
+                        <option value="underlying_percentage_down">Underlying % ↓</option>
+                      </select>
+                      <input type="number" min="0" step="0.01" value={lazyLegConfig.momentum_value || ''} onChange={(e) => setLazyLegConfig(prev => ({ ...prev, momentum_value: e.target.value }))} disabled={!lazyLegConfig.momentum_enabled} className="w-24 px-3.5 h-8 text-[13px] border border-[#e3e3e3] rounded-md bg-white font-normal outline-none transition-colors disabled:opacity-40" placeholder="0" />
                     </div>
                   </div>
                 </div>
-
-                {/* Row 5: Range Break Out (Full width like in the image) */}
-                <div className="flex flex-col">
-                  <div className="flex items-center gap-2 mb-2">
-                    <label className="text-xs font-semibold text-slate-700">Range Break Out</label>
-                    <ToggleSwitch
-                      checked={sequentialLegConfig.range_breakout_enabled || false}
-                      onChange={(e) => {
-                        if (e.target.checked && sequentialLegConfig.momentum_enabled) {
-                          setResponsePopup({
-                            type: 'error',
-                            title: 'Please disable Simple Momentum first.'
-                          });
-                          return;
-                        }
-                        setSequentialLegConfig({...sequentialLegConfig, range_breakout_enabled: e.target.checked});
-                      }}
-                    />
-                  </div>
-                  <div className="flex gap-2 items-center">
-                    <select
-                      value={sequentialLegConfig.range_instrument}
-                      onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, range_instrument: e.target.value})}
-                      disabled={!sequentialLegConfig.range_breakout_enabled}
-                      className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                    >
-                      <option value="instrument">Instrument</option>
-                      <option value="underlying">Underlying</option>
-                    </select>
-                    <input
-                      type="text"
-                      value={sequentialLegConfig.range_time}
-                      onChange={(e) => setSequentialLegConfig({...sequentialLegConfig, range_time: e.target.value})}
-                      disabled={!sequentialLegConfig.range_breakout_enabled}
-                      placeholder="14:45"
-                      className="w-24 px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-50"
-                    />
-                    <button
-                      onClick={() => setSequentialLegConfig({...sequentialLegConfig, range_direction: 'high'})}
-                      disabled={!sequentialLegConfig.range_breakout_enabled}
-                      className={`px-4 py-2 rounded-lg text-xs font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed ${
-                        sequentialLegConfig.range_direction === 'high' && sequentialLegConfig.range_breakout_enabled
-                          ? 'text-white shadow-md'
-                          : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                      }`}
-                      style={sequentialLegConfig.range_direction === 'high' && sequentialLegConfig.range_breakout_enabled ? { backgroundColor: '#4682b4' } : {}}
-                    >
-                      High
-                    </button>
-                    <button
-                      onClick={() => setSequentialLegConfig({...sequentialLegConfig, range_direction: 'low'})}
-                      disabled={!sequentialLegConfig.range_breakout_enabled}
-                      className={`px-4 py-2 rounded-lg text-xs font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed ${
-                        sequentialLegConfig.range_direction === 'low' && sequentialLegConfig.range_breakout_enabled
-                          ? 'text-white shadow-md'
-                          : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                      }`}
-                      style={sequentialLegConfig.range_direction === 'low' && sequentialLegConfig.range_breakout_enabled ? { backgroundColor: '#4682b4' } : {}}
-                    >
-                      Low
-                    </button>
-                  </div>
-                </div>
-              </div>
               </div>
             </div>
 
-            {/* Modal Footer */}
-            <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-gray-200 bg-gray-50 sticky bottom-0">
+            <div className="flex items-center justify-end gap-2 bg-white pt-3 px-5 pb-4">
               <button
                 onClick={() => {
-                  setShowSequentialLegModal(false);
-                  setSequentialLegParentIndex(null);
+                  setShowLazyLegModal(false);
+                  setLazyLegContext(null);
                 }}
-                className="px-6 py-2 text-gray-700 hover:text-gray-900 font-medium transition-colors"
+                className="px-4 py-3 text-[12px] font-medium rounded hover:bg-gray-50 transition-colors"
+                style={{ color: colors.settingsPanel.inactiveText }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={createLazyLeg}
+                className="px-4 py-2 text-[12px] font-medium text-white rounded border transition-colors"
+                style={{ backgroundColor: colors.legBuilder.addLegBg, borderColor: colors.legBuilder.addLegBg }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.backgroundColor = colors.legBuilder.addLegHoverBg;
+                  e.currentTarget.style.borderColor = colors.legBuilder.addLegHoverBg;
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.backgroundColor = colors.legBuilder.addLegBg;
+                  e.currentTarget.style.borderColor = colors.legBuilder.addLegBg;
+                }}
+              >
+                Create and Select
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showSequentialLegModal && (
+        <div className="fixed inset-0 flex items-center justify-center z-50 p-3" style={{ backgroundColor: 'rgba(42, 42, 42, 0.7)', fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" }}>
+          <div className="bg-white rounded-md w-full max-w-7xl max-h-[95vh] overflow-y-auto">
+            <div className="flex items-center justify-between px-4 py-3 border-b bg-[#fafafa] border-[#e3e3e3] rounded-t-md">
+              <h2 className="text-[16px] font-normal text-[#3a3a3a]">
+                Create Sequential Leg for LEG #{mainLegPosition(config.legs, sequentialLegParentId)}
+              </h2>
+              <button
+                onClick={closeSequentialLegModal}
+                className="w-6 h-6 p-0.5 rounded-full flex items-center justify-center text-[#555555] hover:bg-[#f3f3f3] transition-colors"
+                title="Close"
+              >
+                <X size={20} />
+              </button>
+            </div>
+
+            <div className="pt-4 px-5 pb-3">
+              <div className="flex items-center gap-3 mb-5">
+                <label className="text-[13px] font-medium text-gray-700 whitespace-nowrap">Enter Leg Name</label>
+                <input
+                  value={sequentialLegConfig.customName}
+                  onChange={(e) => setSequentialLegConfig(prev => ({ ...prev, customName: e.target.value }))}
+                  placeholder={`SEQ${mainLegPosition(config.legs, sequentialLegParentId)}`}
+                  className="w-44 px-3.5 h-8 text-[13px] border rounded-md bg-white outline-none"
+                  style={{ borderColor: colors.settingsPanel.fieldBorder, color: colors.settingsPanel.inputValue }}
+                />
+              </div>
+
+              <div className="border rounded-lg px-6 py-6" style={{ borderColor: colors.settingsPanel.cardBorder }}>
+                {/* Row 1 */}
+                <div className="flex flex-wrap items-end justify-center gap-x-6 gap-y-4">
+                  <div className="flex flex-col">
+                    <label className="text-[13px] font-medium text-gray-700 mb-1.5">Lots</label>
+                    <input type="number" min="1" step="1" value={sequentialLegConfig.lots} onChange={(e) => { const val = e.target.value; if (val !== '') { if (val.includes('.')) { setResponsePopup({ type: 'error', title: 'Total Lot must be a whole number' }); return; } if (Number(val) < 0) { setResponsePopup({ type: 'error', title: 'Total Lot cannot be negative' }); return; } if (Number(val) === 0) { setResponsePopup({ type: 'error', title: 'Total Lot must be at least 1' }); return; } } setSequentialLegConfig(prev => ({ ...prev, lots: val })); }} className="lot-spinner w-24 px-3.5 h-8 text-[13px] font-normal border border-[#e3e3e3] rounded-md bg-white outline-none" style={{ color: colors.settingsPanel.inputValue }} placeholder="1" />
+                  </div>
+                  <div className="flex flex-col">
+                    <label className="text-[13px] font-medium text-gray-700 mb-1.5">Position</label>
+                    <select value={sequentialLegConfig.position} onChange={(e) => setSequentialLegConfig(prev => ({ ...prev, position: e.target.value }))} className="appearance-none w-[5.75rem] px-3.5 pr-8 h-8 text-[13px] font-normal border rounded-md outline-none cursor-pointer" style={{ backgroundColor: colors.dropdownPlain.background, borderColor: colors.settingsPanel.fieldBorder, color: colors.settingsPanel.inputValue, backgroundImage: selectChevron('%234B5563'), backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.6rem center' }}>
+                      <option value="buy">Buy</option>
+                      <option value="sell">Sell</option>
+                    </select>
+                  </div>
+                  <div className="flex flex-col">
+                    <label className="text-[13px] font-medium text-gray-700 mb-1.5">Option Type</label>
+                    <select value={sequentialLegConfig.option_type} onChange={(e) => setSequentialLegConfig(prev => ({ ...prev, option_type: e.target.value }))} className="appearance-none w-[5.75rem] px-3.5 pr-8 h-8 text-[13px] font-normal border rounded-md outline-none cursor-pointer" style={{ backgroundColor: colors.dropdownPlain.background, borderColor: colors.settingsPanel.fieldBorder, color: colors.settingsPanel.inputValue, backgroundImage: selectChevron('%234B5563'), backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.6rem center' }}>
+                      <option value="call">Call</option>
+                      <option value="put">Put</option>
+                    </select>
+                  </div>
+                  <div className="flex flex-col">
+                    <label className="text-[13px] font-medium text-gray-700 mb-1.5">Expiry</label>
+                    <select value={sequentialLegConfig.expiry} onChange={(e) => { warnIfWeeklyLegExpiry(e.target.value); setSequentialLegConfig(prev => ({ ...prev, expiry: e.target.value })); }} className="appearance-none w-[9.5rem] px-3.5 pr-8 h-8 text-[13px] font-normal border rounded-md outline-none cursor-pointer" style={{ backgroundColor: colors.dropdownPlain.background, borderColor: colors.settingsPanel.fieldBorder, color: colors.settingsPanel.inputValue, backgroundImage: selectChevron('%234B5563'), backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.6rem center' }}>
+                      <option value="weekly">Weekly</option>
+                      <option value="next_weekly">Next Weekly</option>
+                      <option value="monthly">Monthly</option>
+                      <option value="next_monthly">Next Monthly</option>
+                    </select>
+                  </div>
+                  <div className="flex flex-col">
+                    <label className="text-[13px] font-medium text-gray-700 mb-1.5 flex items-center gap-1">
+                      Select Strike Criteria
+                      <Info size={12} className="text-gray-400" />
+                    </label>
+                    <select value={sequentialLegConfig.strike_criteria} onChange={(e) => setSequentialLegConfig(prev => ({ ...prev, strike_criteria: e.target.value }))} className="appearance-none w-[15rem] px-3.5 pr-8 h-8 text-[13px] font-normal border rounded-md outline-none cursor-pointer" style={{ backgroundColor: colors.dropdownPlain.background, borderColor: colors.settingsPanel.fieldBorder, color: colors.settingsPanel.inputValue, backgroundImage: selectChevron('%234B5563'), backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.6rem center' }}>
+                      <option value="based on points">Based On Strike</option>
+                      <option value="based on atm percent">Based On ATM %</option>
+                      <option value="based on premium range">Based On premium range</option>
+                      <option value="closest premium">Based On Closest Premium</option>
+                    </select>
+                  </div>
+                  {sequentialLegConfig.strike_criteria === 'based on points' && (
+                    <div className="flex flex-col w-[7.5rem]">
+                      <StrikeSelector size="md" value={sequentialLegConfig.atm_strike || 'atm'} onChange={(value) => setSequentialLegConfig(prev => ({ ...prev, atm_strike: value }))} />
+                    </div>
+                  )}
+                  {sequentialLegConfig.strike_criteria === 'based on atm percent' && (
+                    <div className="flex items-center gap-2">
+                      <span className="text-[13px] font-medium text-gray-700">ATM</span>
+                      <select value={sequentialLegConfig.atm_percent_direction || '+'} onChange={(e) => setSequentialLegConfig(prev => ({ ...prev, atm_percent_direction: e.target.value }))} className="appearance-none w-full pl-3.5 pr-7 h-8 text-[13px] border border-[#e3e3e3] rounded-md font-normal outline-none cursor-pointer" style={{ backgroundColor: colors.dropdownPlain.background, borderColor: colors.settingsPanel.fieldBorder, color: colors.settingsPanel.inputValue, backgroundImage: selectChevron('%234B5563'), backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.6rem center' }}>
+                        <option value="+">+</option>
+                        <option value="-">-</option>
+                      </select>
+                      <div className="relative flex items-center">
+                        <input type="number" min="0" step="0.01" value={sequentialLegConfig.atm_percent_value ?? ''} onChange={(e) => setSequentialLegConfig(prev => ({ ...prev, atm_percent_value: e.target.value }))} className="w-24 pl-3.5 pr-8 h-8 text-[13px] border border-[#e3e3e3] rounded-md bg-white font-normal outline-none" placeholder="0" />
+                        <span className="absolute right-3 text-[13px] font-normal text-gray-700 pointer-events-none">%</span>
+                      </div>
+                      <span className="text-[13px] font-medium text-gray-700 whitespace-nowrap">of ATM</span>
+                    </div>
+                  )}
+                  {sequentialLegConfig.strike_criteria === 'closest premium' && (
+                    <div className="flex flex-col">
+                      <label className="text-[13px] font-medium text-gray-700 mb-1.5">Premium</label>
+                      <input type="number" min="0" step="0.01" value={sequentialLegConfig.closest_premium_value ?? ''} onChange={(e) => setSequentialLegConfig(prev => ({ ...prev, closest_premium_value: e.target.value }))} className="w-[6.25rem] px-3.5 h-8 text-[13px] border border-[#e3e3e3] rounded-md bg-white font-normal outline-none transition-colors disabled:opacity-40" placeholder="50" />
+                    </div>
+                  )}
+                  {sequentialLegConfig.strike_criteria === 'based on premium range' && (
+                    <>
+                      <div className="flex flex-col">
+                        <label className="text-[13px] font-medium text-gray-700 mb-1.5">Lower</label>
+                        <input type="number" step="0.01" value={sequentialLegConfig.lower_range ?? ''} onChange={(e) => setSequentialLegConfig(prev => ({ ...prev, lower_range: e.target.value }))} className="w-[6.25rem] px-3.5 h-8 text-[13px] border border-[#e3e3e3] rounded-md bg-white font-normal outline-none transition-colors disabled:opacity-40" placeholder="50" />
+                      </div>
+                      <div className="flex flex-col">
+                        <label className="text-[13px] font-medium text-gray-700 mb-1.5">Upper</label>
+                        <input type="number" step="0.01" value={sequentialLegConfig.upper_range ?? ''} onChange={(e) => setSequentialLegConfig(prev => ({ ...prev, upper_range: e.target.value }))} className="w-[6.25rem] px-3.5 h-8 text-[13px] border border-[#e3e3e3] rounded-md bg-white font-normal outline-none transition-colors disabled:opacity-40" placeholder="100" />
+                      </div>
+                    </>
+                  )}
+                </div>
+
+                {/* Row 2: Target Profit / Stop Loss / Trail SL */}
+                <div className="modal-field-row flex flex-wrap justify-center items-start gap-x-7 gap-y-5 mt-6">
+                  <div className="flex flex-col space-y-2">
+                    <div className="flex items-center gap-2">
+                      <label className="text-[13px] font-medium text-gray-700">Target Profit</label>
+                      <ToggleSwitch size="sm" checked={sequentialLegConfig.target_enabled || false} onChange={modalTargetToggle(setSequentialLegConfig)} id="seqTargetProfit" />
+                    </div>
+                    <div className="flex gap-2">
+                      <select style={{ backgroundColor: colors.settingsPanel.activeBg, color: colors.settingsPanel.activeText, borderColor: colors.settingsPanel.activeBg, backgroundImage: selectChevron('white'), backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.6rem center' }} value={sequentialLegConfig.target_type || 'points'} onChange={(e) => setSequentialLegConfig(prev => ({ ...prev, target_type: e.target.value }))} disabled={!sequentialLegConfig.target_enabled} className="appearance-none w-[10.25rem] pl-3.5 pr-8 h-8 text-[13px] border rounded-md font-normal outline-none transition-colors disabled:opacity-40">
+                        <option value="points">Points (Pts)</option>
+                        <option value="underlying_points">Underlying Pts</option>
+                        <option value="percentage">Percent (%)</option>
+                        <option value="underlying_percentage">Underlying %</option>
+                      </select>
+                      <input type="number" min="0" step="0.01" value={sequentialLegConfig.target_value || ''} onChange={(e) => { const val = e.target.value; if (val !== '' && Number(val) < 0) { setResponsePopup({ type: 'error', title: 'Target value cannot be negative' }); return; } setSequentialLegConfig(prev => ({ ...prev, target_value: val })); }} disabled={!sequentialLegConfig.target_enabled} className="w-[6.25rem] px-3.5 h-8 text-[13px] border border-[#e3e3e3] rounded-md bg-white font-normal outline-none transition-colors disabled:opacity-40" placeholder="0" />
+                    </div>
+                  </div>
+                  <div className="flex flex-col space-y-2">
+                    <div className="flex items-center gap-2">
+                      <label className="text-[13px] font-medium text-gray-700">Stop Loss</label>
+                      <ToggleSwitch size="sm" checked={sequentialLegConfig.stop_loss_enabled || false} onChange={modalStopLossToggle(setSequentialLegConfig)} id="seqStopLoss" />
+                    </div>
+                    <div className="flex gap-2">
+                      <select style={{ backgroundColor: colors.settingsPanel.activeBg, color: colors.settingsPanel.activeText, borderColor: colors.settingsPanel.activeBg, backgroundImage: selectChevron('white'), backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.6rem center' }} value={sequentialLegConfig.stop_loss_type || 'points'} onChange={(e) => setSequentialLegConfig(prev => ({ ...prev, stop_loss_type: e.target.value }))} disabled={!sequentialLegConfig.stop_loss_enabled} className="appearance-none w-[10.25rem] pl-3.5 pr-8 h-8 text-[13px] border rounded-md font-normal outline-none transition-colors disabled:opacity-40">
+                        <option value="points">Points (Pts)</option>
+                        <option value="underlying_points">Underlying Pts</option>
+                        <option value="percentage">Percent (%)</option>
+                        <option value="underlying_percentage">Underlying %</option>
+                      </select>
+                      <input type="number" min="0" step="0.01" value={sequentialLegConfig.stop_loss_value || ''} onChange={(e) => { const val = e.target.value; if (val !== '' && Number(val) < 0) { setResponsePopup({ type: 'error', title: 'Stop Loss value cannot be negative' }); return; } setSequentialLegConfig(prev => ({ ...prev, stop_loss_value: val })); }} disabled={!sequentialLegConfig.stop_loss_enabled} className="w-[6.25rem] px-3.5 h-8 text-[13px] border border-[#e3e3e3] rounded-md bg-white font-normal outline-none transition-colors disabled:opacity-40" placeholder="0" />
+                    </div>
+                  </div>
+                  <div className="flex flex-col space-y-2">
+                    <div className="flex items-center gap-2">
+                      <label className="text-[13px] font-medium text-gray-700">Trail SL</label>
+                      <Info size={14} className="text-gray-400" />
+                      <ToggleSwitch size="sm" checked={sequentialLegConfig.trail_sl_enabled || false} onChange={(e) => { if (e.target.checked && !modalStopLossReady(sequentialLegConfig)) return; setSequentialLegConfig(prev => ({ ...prev, trail_sl_enabled: e.target.checked })); }} id="seqTrailSL" />
+                    </div>
+                    <div className="flex gap-2">
+                      <select style={{ backgroundColor: colors.settingsPanel.activeBg, color: colors.settingsPanel.activeText, borderColor: colors.settingsPanel.activeBg, backgroundImage: selectChevron('white'), backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.6rem center' }} value={sequentialLegConfig.trail_sl_type || 'points'} onChange={(e) => setSequentialLegConfig(prev => ({ ...prev, trail_sl_type: e.target.value }))} disabled={!sequentialLegConfig.trail_sl_enabled} className="appearance-none w-36 pl-3.5 pr-8 h-8 text-[13px] border rounded-md font-normal outline-none transition-colors disabled:opacity-40">
+                        <option value="points">Points</option>
+                        <option value="percentage">Percentage</option>
+                      </select>
+                      <input type="number" min="0" step="0.01" value={sequentialLegConfig.trail_sl_value || ''} onChange={(e) => setSequentialLegConfig(prev => ({ ...prev, trail_sl_value: e.target.value }))} disabled={!sequentialLegConfig.trail_sl_enabled} className="w-[5.5rem] px-3.5 h-8 text-[13px] border border-[#e3e3e3] rounded-md bg-white font-normal outline-none transition-colors disabled:opacity-40" placeholder="0" />
+                      <input type="number" min="0" step="0.01" value={sequentialLegConfig.trail_sl_lock_value || ''} onChange={(e) => setSequentialLegConfig(prev => ({ ...prev, trail_sl_lock_value: e.target.value }))} disabled={!sequentialLegConfig.trail_sl_enabled} className="w-[5.5rem] px-3.5 h-8 text-[13px] border border-[#e3e3e3] rounded-md bg-white font-normal outline-none transition-colors disabled:opacity-40" placeholder="0" />
+                    </div>
+                  </div>
+                </div>
+
+                {/* Row 3: Re-entries / Momentum */}
+                <div className="modal-field-row flex flex-wrap justify-center items-start gap-x-7 gap-y-5 mt-6">
+                  <div className="flex flex-col space-y-2">
+                    <div className="flex items-center gap-2">
+                      <label className="text-[13px] font-medium text-gray-700">Re-entry on Tgt</label>
+                      <Info size={14} className="text-gray-400" />
+                      <ToggleSwitch size="sm" checked={sequentialLegConfig.reentry_tgt_enabled || false} onChange={(e) => { if (e.target.checked && !modalTargetReady(sequentialLegConfig)) return; setSequentialLegConfig(prev => ({ ...prev, reentry_tgt_enabled: e.target.checked })); }} id="seqReentryTgt" />
+                    </div>
+                    <div className="flex gap-2">
+                      <select style={{ backgroundColor: colors.settingsPanel.activeBg, color: colors.settingsPanel.activeText, borderColor: colors.settingsPanel.activeBg, backgroundImage: selectChevron('white'), backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.6rem center' }} value={sequentialLegConfig.reentry_tgt_mode || 're_asap'} onChange={(e) => setSequentialLegConfig(prev => ({ ...prev, reentry_tgt_mode: e.target.value }))} disabled={!sequentialLegConfig.reentry_tgt_enabled} className="appearance-none w-40 pl-3.5 pr-8 h-8 text-[13px] border rounded-md font-normal outline-none transition-colors disabled:opacity-40">
+                        <option value="re_asap">RE ASAP</option>
+                        <option value="re_asap_reverse">RE ASAP ↩</option>
+                        <option value="re_momentum" disabled={!sequentialLegConfig.momentum_enabled}>RE MOMENTUM</option>
+                        <option value="re_momentum_reverse" disabled={!sequentialLegConfig.momentum_enabled}>RE MOMENTUM ↩</option>
+                        <option value="re_cost">RE COST</option>
+                        <option value="re_cost_reverse">RE COST ↩</option>
+                      </select>
+                      <ReentryCountDropdown value={sequentialLegConfig.reentry_tgt_count} onChange={(v) => setSequentialLegConfig(prev => ({ ...prev, reentry_tgt_count: v }))} disabled={!sequentialLegConfig.reentry_tgt_enabled} heightClass="h-8" />
+                    </div>
+                  </div>
+                  <div className="flex flex-col space-y-2">
+                    <div className="flex items-center gap-2">
+                      <label className="text-[13px] font-medium text-gray-700">Re-entry on SL</label>
+                      <Info size={14} className="text-gray-400" />
+                      <ToggleSwitch size="sm" checked={sequentialLegConfig.reentry_sl_enabled || false} onChange={(e) => { if (e.target.checked && !modalStopLossReady(sequentialLegConfig)) return; setSequentialLegConfig(prev => ({ ...prev, reentry_sl_enabled: e.target.checked })); }} id="seqReentrySL" />
+                    </div>
+                    <div className="flex gap-2">
+                      <select style={{ backgroundColor: colors.settingsPanel.activeBg, color: colors.settingsPanel.activeText, borderColor: colors.settingsPanel.activeBg, backgroundImage: selectChevron('white'), backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.6rem center' }} value={sequentialLegConfig.reentry_sl_mode || 're_asap'} onChange={(e) => setSequentialLegConfig(prev => ({ ...prev, reentry_sl_mode: e.target.value }))} disabled={!sequentialLegConfig.reentry_sl_enabled} className="appearance-none w-40 pl-3.5 pr-8 h-8 text-[13px] border rounded-md font-normal outline-none transition-colors disabled:opacity-40">
+                        <option value="re_asap">RE ASAP</option>
+                        <option value="re_asap_reverse">RE ASAP ↩</option>
+                        <option value="re_momentum" disabled={!sequentialLegConfig.momentum_enabled}>RE MOMENTUM</option>
+                        <option value="re_momentum_reverse" disabled={!sequentialLegConfig.momentum_enabled}>RE MOMENTUM ↩</option>
+                        <option value="re_cost">RE COST</option>
+                        <option value="re_cost_reverse">RE COST ↩</option>
+                      </select>
+                      <ReentryCountDropdown value={sequentialLegConfig.reentry_sl_count} onChange={(v) => setSequentialLegConfig(prev => ({ ...prev, reentry_sl_count: v }))} disabled={!sequentialLegConfig.reentry_sl_enabled} heightClass="h-8" />
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 bg-white pt-3 px-5 pb-4">
+              <button
+                onClick={closeSequentialLegModal}
+                className="px-4 py-3 text-[12px] font-medium rounded hover:bg-gray-50 transition-colors"
+                style={{ color: colors.settingsPanel.inactiveText }}
               >
                 Cancel
               </button>
               <button
                 onClick={createSequentialLeg}
-                className="px-6 py-2 text-white rounded-lg hover:bg-blue-700 font-medium transition-all shadow-sm"
-                style={{ backgroundColor: '#4682b4' }}
+                className="px-4 py-2 text-[12px] font-medium text-white rounded border transition-colors"
+                style={{ backgroundColor: colors.legBuilder.addLegBg, borderColor: colors.legBuilder.addLegBg }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.backgroundColor = colors.legBuilder.addLegHoverBg;
+                  e.currentTarget.style.borderColor = colors.legBuilder.addLegHoverBg;
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.backgroundColor = colors.legBuilder.addLegBg;
+                  e.currentTarget.style.borderColor = colors.legBuilder.addLegBg;
+                }}
               >
                 Create
               </button>
@@ -3979,17 +3128,40 @@ import logger from '../utils/logger';
         </div>
       )}
 
+
             {/* ADDED LEGS - STRUCTURED LAYOUT MATCHING LEG BUILDER DESIGN */}
       {config.legs.length > 0 && (() => {
-        // Hoist sort outside map to avoid O(n² log n) - sort ONCE, not once per leg
-        const sortedLegs = [...config.legs].sort((a, b) => {
-          if (a.isLazyLeg && !b.isLazyLeg) return 1;
-          if (!a.isLazyLeg && b.isLazyLeg) return -1;
-          return 0;
-        });
+        const sortedLegs = (() => {
+          const ordered = [];
+          const placed = new Set();
+
+          config.legs
+            .filter(l => !l.isLazyLeg && !l.isSequentialLeg)
+            .forEach(mainLeg => {
+              ordered.push(mainLeg);
+              placed.add(mainLeg.id);
+              const seq = config.legs.find(l => l.isSequentialLeg && l.parentLegId === mainLeg.id);
+              if (seq) {
+                ordered.push(seq);
+                placed.add(seq.id);
+              }
+            });
+
+          config.legs.forEach(l => {
+            if (!placed.has(l.id) && !l.isLazyLeg) ordered.push(l);
+          });
+          config.legs.forEach(l => {
+            if (l.isLazyLeg) ordered.push(l);
+          });
+
+          return ordered;
+        })();
 
         return (
-          <div className="mx-12">
+          <div className="builder-legs-pad mx-0">
+            {sortedLegs.length > 0 && (
+              <h2 className="text-[20px] font-normal mb-2.5" style={{ color: colors.settingsPanel.heading }}>Legs</h2>
+            )}
             {sortedLegs.map((leg, displayIndex) => {
               const legIndex = config.legs.findIndex(l => l.id === leg.id);
 
@@ -4000,16 +3172,22 @@ import logger from '../utils/logger';
                 .length;
 
               return (
+                <Fragment key={`legwrap-${leg.id}`}>
+                {leg.isLazyLeg && sortedLegs.find(l => l.isLazyLeg) === leg && (
+                  <h2 className="text-[20px] font-normal mb-2.5 mt-2" style={{ color: colors.settingsPanel.heading }}>Lazy Legs</h2>
+                )}
                 <LegCard
                   key={leg.id}
                   leg={leg}
                   legIndex={legIndex}
                   mainLegNumber={mainLegNumber}
-                  allLegs={config.legs} // Changed: pass specific data instead of entire config
-                  strategyType={config.strategy_type} // Changed: pass specific data instead of entire config
-                  dteFilter={config.dte_filter} // Changed: pass specific data instead of entire config
+                  allLegs={config.legs} 
+                  strategyType={config.strategy_type} 
+                  entryTime={config.entry_time}
+                  dteFilter={config.dte_filter} 
+                  positionalExpiry={config.positional_expiry}
                   updateLegInPlace={updateLegInPlace}
-                  duplicateLeg={duplicateLeg} // Changed: added memoized duplicate handler
+                  duplicateLeg={duplicateLeg} 
                   removeLeg={removeLeg}
                   setResponsePopup={setResponsePopup}
                   legValidationErrors={legValidationErrors}
@@ -4022,9 +3200,10 @@ import logger from '../utils/logger';
                   setLazyLegConfig={setLazyLegConfig}
                   setLazyLegContext={setLazyLegContext}
                   setShowLazyLegModal={setShowLazyLegModal}
-                  setSequentialLegParentIndex={setSequentialLegParentIndex}
-                  setShowSequentialLegModal={setShowSequentialLegModal}
+                  onAddSequentialLeg={openSequentialLegModal}
+                  sidebarOpen={sidebarOpen}
                 />
+                </Fragment>
               );
             })}
           </div>
@@ -4032,24 +3211,23 @@ import logger from '../utils/logger';
       })()}
 
       {/* OVERALL STRATEGY SETTINGS SECTION - REDESIGNED WITH COMPACT STYLE */}
-      <div className="mx-12">
-        <div className="bg-white rounded-lg shadow-sm border border-gray-200 px-10 py-10 mt-8 animate-fade-in">
-          {/* Header */}
-          <h3 className="text-lg font-bold mb-6 flex items-center gap-2 uppercase" style={{ color: '#4682b4' }}>
+      <div data-pdf-block className="mx-0 mt-8 animate-fade-in">
+          <h3 className="text-[20px] font-normal mb-2.5 flex items-center gap-2" style={{ color: colors.settingsPanel.heading }}>
             Overall strategy settings
-            <Info size={14} style={{ color: '#4682b4' }} />
+            <Info size={14} style={{ color: colors.settingsPanel.heading }} />
           </h3>
 
           {/* Main Layout: 3 columns in row 1, with re-entry fields below */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
+          <div className="builder-overall-grid grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-[minmax(0,20rem)_minmax(0,20rem)_minmax(0,1fr)] gap-6">
             
-            {/* Column 1: Overall Stop Loss + Overall Re-entry on SL (stacked vertically) */}
-            <div className="flex flex-col space-y-4">
+            {/* Column 1: Overall Stop Loss + Overall Target (stacked vertically) */}
+            <div className="flex flex-col space-y-5 bg-white rounded-lg border p-5" style={{ borderColor: colors.settingsPanel.cardBorder }}>
               {/* Overall Stop Loss */}
               <div className="flex flex-col space-y-2">
                 <div className="flex items-center gap-3">
-                  <label className="text-sm font-semibold text-gray-700">Overall Stop Loss</label>
-                  <ToggleSwitch 
+                  <label className="text-[14px] font-medium text-gray-700">Overall Stop Loss</label>
+                  <ToggleSwitch
+                    size="sm"
                     checked={config.overall_stop_loss_enabled} 
                     onChange={(e) => handleChange('overall_stop_loss_enabled', e.target.checked)} 
                     id="overallStopLoss" 
@@ -4057,13 +3235,14 @@ import logger from '../utils/logger';
                 </div>
                 <div className="flex gap-2">
                   <select 
-                    value={config.overall_stop_loss_mode} 
-                    onChange={(e) => handleChange('overall_stop_loss_mode', e.target.value)} 
-                    disabled={!config.overall_stop_loss_enabled} 
-                    className="flex-1 min-w-0 px-3 py-3 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50"
+                  style={{ backgroundColor: colors.settingsPanel.activeBg, color: colors.settingsPanel.activeText, borderColor: colors.settingsPanel.activeBg, backgroundImage: selectChevron('white'), backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.6rem center' }}
+                    value={config.overall_stop_loss_mode}
+                    onChange={(e) => handleChange('overall_stop_loss_mode', e.target.value)}
+                    disabled={!config.overall_stop_loss_enabled}
+                    className="appearance-none w-36 pl-3.5 pr-8 h-8 text-[14px] border rounded-md font-normal outline-none transition-colors disabled:opacity-40"
                   >
                     <option value="mtm">MTM</option>
-                    <option value="percent">PERCENT</option>
+                    <option value="percent">Percent</option>
                   </select>
                   <input 
                     type="number" 
@@ -4081,69 +3260,20 @@ import logger from '../utils/logger';
                         return;
                       }
                       handleChange('overall_stop_loss_value', val);
-                    }} 
-                    disabled={!config.overall_stop_loss_enabled} 
-                    className="flex-1 min-w-0 px-3 py-3 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50" 
+                    }}
+                    disabled={!config.overall_stop_loss_enabled}
+                    className="w-[5rem] px-3.5 h-8 text-[14px] border border-[#e3e3e3] rounded-md bg-white font-normal outline-none transition-colors disabled:opacity-40"
                     placeholder="0"
                   />
                 </div>
               </div>
 
-              {/* Overall Re-entry on SL - directly below Stop Loss */}
-              <div className="flex flex-col space-y-2">
-                <div className="flex items-center gap-2">
-                  <label className="text-sm font-semibold text-gray-700">Overall Re-entry on SL</label>
-                  <Info size={14} className="text-gray-400" />
-                  <ToggleSwitch 
-                    checked={config.overall_reentry_sl_enabled} 
-                    onChange={(e) => handleChange('overall_reentry_sl_enabled', e.target.checked)} 
-                    id="overallReentrySL" 
-                  />
-                </div>
-                <div className="flex gap-2">
-                  <select 
-                    value={config.overall_reentry_sl_mode} 
-                    onChange={(e) => handleChange('overall_reentry_sl_mode', e.target.value)} 
-                    disabled={!config.overall_reentry_sl_enabled} 
-                    className="flex-1 min-w-0 px-3 py-3 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50"
-                  >
-                    <option value="re_asap">RE ASAP</option>
-                    <option value="re_asap_reverse">RE ASAP REV</option>
-                    <option value="re_momentum">RE MOMENTUM</option>
-                    <option value="re_momentum_reverse">RE MOMENTUM REV</option>
-                  </select>
-                  <input 
-                    type="number" 
-                    min="0"
-                    step="1"
-                    value={config.overall_reentry_sl_count} 
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      if (val !== '' && val.includes('.')) {
-                        setResponsePopup({ type: 'error', title: 'Re-entry count must be a whole number' });
-                        return;
-                      }
-                      if (val !== '' && Number(val) < 0) {
-                        setResponsePopup({ type: 'error', title: 'Re-entry count cannot be negative' });
-                        return;
-                      }
-                      handleChange('overall_reentry_sl_count', val);
-                    }} 
-                    disabled={!config.overall_reentry_sl_enabled} 
-                    className="flex-1 min-w-0 px-3 py-3 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50" 
-                    placeholder="0"
-                  />
-                </div>
-              </div>
-            </div>
-
-            {/* Column 2: Overall Target + Overall Re-entry on Tgt (stacked vertically) */}
-            <div className="flex flex-col space-y-4">
-              {/* Overall Target */}
+              {/* Overall Target - directly below Stop Loss */}
               <div className="flex flex-col space-y-2">
                 <div className="flex items-center gap-3">
-                  <label className="text-sm font-semibold text-gray-700">Overall Target</label>
-                  <ToggleSwitch 
+                  <label className="text-[14px] font-medium text-gray-700">Overall Target</label>
+                  <ToggleSwitch
+                    size="sm"
                     checked={config.overall_target_enabled} 
                     onChange={(e) => handleChange('overall_target_enabled', e.target.checked)} 
                     id="overallTarget" 
@@ -4151,19 +3281,20 @@ import logger from '../utils/logger';
                 </div>
                 <div className="flex gap-2">
                   <select 
-                    value={config.overall_target_mode} 
-                    onChange={(e) => handleChange('overall_target_mode', e.target.value)} 
-                    disabled={!config.overall_target_enabled} 
-                    className="flex-1 min-w-0 px-3 py-3 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50"
+                  style={{ backgroundColor: colors.settingsPanel.activeBg, color: colors.settingsPanel.activeText, borderColor: colors.settingsPanel.activeBg, backgroundImage: selectChevron('white'), backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.6rem center' }}
+                    value={config.overall_target_mode}
+                    onChange={(e) => handleChange('overall_target_mode', e.target.value)}
+                    disabled={!config.overall_target_enabled}
+                    className="appearance-none w-36 pl-3.5 pr-8 h-8 text-[14px] border rounded-md font-normal outline-none transition-colors disabled:opacity-40"
                   >
                     <option value="mtm">MTM</option>
-                    <option value="percent">PERCENT</option>
+                    <option value="percent">Percent</option>
                   </select>
-                  <input 
-                    type="number" 
+                  <input
+                    type="number"
                     min="0"
                     step="1"
-                    value={config.overall_target_value} 
+                    value={config.overall_target_value}
                     onChange={(e) => {
                       const val = e.target.value;
                       if (val !== '' && val.includes('.')) {
@@ -4175,87 +3306,111 @@ import logger from '../utils/logger';
                         return;
                       }
                       handleChange('overall_target_value', val);
-                    }} 
-                    disabled={!config.overall_target_enabled} 
-                    className="flex-1 min-w-0 px-3 py-3 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50" 
-                    placeholder="0"
-                  />
-                </div>
-              </div>
-
-              {/* Overall Re-entry on Tgt - directly below Target */}
-              <div className="flex flex-col space-y-2">
-                <div className="flex items-center gap-2">
-                  <label className="text-sm font-semibold text-gray-700">Overall Re-entry on Tgt</label>
-                  <Info size={14} className="text-gray-400" />
-                  <ToggleSwitch 
-                    checked={config.overall_reentry_tgt_enabled} 
-                    onChange={(e) => handleChange('overall_reentry_tgt_enabled', e.target.checked)} 
-                    id="overallReentryTgt" 
-                  />
-                </div>
-                <div className="flex gap-2">
-                  <select 
-                    value={config.overall_reentry_tgt_mode} 
-                    onChange={(e) => handleChange('overall_reentry_tgt_mode', e.target.value)} 
-                    disabled={!config.overall_reentry_tgt_enabled} 
-                    className="flex-1 min-w-0 px-3 py-3 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50"
-                  >
-                    <option value="re_asap">RE ASAP</option>
-                    <option value="re_asap_reverse">RE ASAP REV</option>
-                    <option value="re_momentum">RE MOMENTUM</option>
-                    <option value="re_momentum_reverse">RE MOMENTUM REV</option>
-                  </select>
-                  <input 
-                    type="number" 
-                    min="0"
-                    step="1"
-                    value={config.overall_reentry_tgt_count} 
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      if (val !== '' && val.includes('.')) {
-                        setResponsePopup({ type: 'error', title: 'Re-entry count must be a whole number' });
-                        return;
-                      }
-                      if (val !== '' && Number(val) < 0) {
-                        setResponsePopup({ type: 'error', title: 'Re-entry count cannot be negative' });
-                        return;
-                      }
-                      handleChange('overall_reentry_tgt_count', val);
-                    }} 
-                    disabled={!config.overall_reentry_tgt_enabled} 
-                    className="flex-1 min-w-0 px-3 py-3 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50" 
+                    }}
+                    disabled={!config.overall_target_enabled}
+                    className="w-[5rem] px-3.5 h-8 text-[14px] border border-[#e3e3e3] rounded-md bg-white font-normal outline-none transition-colors disabled:opacity-40"
                     placeholder="0"
                   />
                 </div>
               </div>
             </div>
 
-            {/* Column 3: Trailing Options */}
-            <div className="flex flex-col space-y-2">
+            {/* Column 2: Overall Re-entry on SL + Overall Re-entry on Tgt (stacked vertically) */}
+            <div className="flex flex-col space-y-5 bg-white rounded-lg border p-5" style={{ borderColor: colors.settingsPanel.cardBorder }}>
+              {/* Overall Re-entry on SL */}
+              <div className="flex flex-col space-y-2">
+                <div className="flex items-center gap-3">
+                  <label className="text-[14px] font-medium text-gray-700 w-[9.75rem]">Overall Re-entry on SL</label>
+                  <ToggleSwitch
+                    size="sm"
+                    checked={config.overall_reentry_sl_enabled} 
+                    onChange={(e) => { handleChange('overall_reentry_sl_enabled', e.target.checked); if (e.target.checked && !config.overall_reentry_sl_count) handleChange('overall_reentry_sl_count', '1'); }} 
+                    id="overallReentrySL" 
+                  />
+                </div>
+                <div className="flex gap-2">
+                  <select 
+                  style={{ backgroundColor: colors.settingsPanel.activeBg, color: colors.settingsPanel.activeText, borderColor: colors.settingsPanel.activeBg, backgroundImage: selectChevron('white'), backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.6rem center' }}
+                    value={config.overall_reentry_sl_mode}
+                    onChange={(e) => handleChange('overall_reentry_sl_mode', e.target.value)}
+                    disabled={!config.overall_reentry_sl_enabled}
+                    className="appearance-none w-40 pl-3.5 pr-8 h-8 text-[14px] border rounded-md font-normal outline-none transition-colors disabled:opacity-40"
+                  >
+                    <option value="re_asap">RE ASAP</option>
+                    <option value="re_asap_reverse">RE ASAP ↩</option>
+                    <option value="re_momentum">RE MOMENTUM</option>
+                    <option value="re_momentum_reverse">RE MOMENTUM ↩</option>
+                  </select>
+                  <ReentryCountDropdown
+                    value={config.overall_reentry_sl_count}
+                    onChange={(v) => handleChange('overall_reentry_sl_count', v)}
+                    disabled={!config.overall_reentry_sl_enabled}
+                    heightClass="h-8"
+                  />
+                </div>
+              </div>
+
+              {/* Overall Re-entry on Tgt - directly below Re-entry on SL */}
+              <div className="flex flex-col space-y-2">
+                <div className="flex items-center gap-3">
+                  <label className="text-[14px] font-medium text-gray-700 w-[9.75rem]">Overall Re-entry on Tgt</label>
+                  <ToggleSwitch
+                    size="sm"
+                    checked={config.overall_reentry_tgt_enabled} 
+                    onChange={(e) => { handleChange('overall_reentry_tgt_enabled', e.target.checked); if (e.target.checked && !config.overall_reentry_tgt_count) handleChange('overall_reentry_tgt_count', '1'); }} 
+                    id="overallReentryTgt" 
+                  />
+                </div>
+                <div className="flex gap-2">
+                  <select 
+                  style={{ backgroundColor: colors.settingsPanel.activeBg, color: colors.settingsPanel.activeText, borderColor: colors.settingsPanel.activeBg, backgroundImage: selectChevron('white'), backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.6rem center' }}
+                    value={config.overall_reentry_tgt_mode}
+                    onChange={(e) => handleChange('overall_reentry_tgt_mode', e.target.value)}
+                    disabled={!config.overall_reentry_tgt_enabled}
+                    className="appearance-none w-40 pl-3.5 pr-8 h-8 text-[14px] border rounded-md font-normal outline-none transition-colors disabled:opacity-40"
+                  >
+                    <option value="re_asap">RE ASAP</option>
+                    <option value="re_asap_reverse">RE ASAP ↩</option>
+                    <option value="re_momentum">RE MOMENTUM</option>
+                    <option value="re_momentum_reverse">RE MOMENTUM ↩</option>
+                  </select>
+                  <ReentryCountDropdown
+                    value={config.overall_reentry_tgt_count}
+                    onChange={(v) => handleChange('overall_reentry_tgt_count', v)}
+                    disabled={!config.overall_reentry_tgt_enabled}
+                    heightClass="h-8"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="flex flex-col space-y-2 bg-white rounded-lg border p-5 w-full" style={{ borderColor: colors.settingsPanel.cardBorder }}>
               <div className="flex items-center gap-3">
-                <label className="text-sm font-semibold text-gray-700">Trailing Options</label>
-                <ToggleSwitch 
-                  checked={config.lock_profit_enabled} 
-                  onChange={(e) => handleChange('lock_profit_enabled', e.target.checked)} 
-                  id="trailingOptions" 
+                <label className="text-[14px] font-medium text-gray-700">Overall Trail SL</label>
+                <ToggleSwitch
+                  size="sm"
+                  checked={config.lock_profit_enabled}
+                  onChange={(e) => handleChange('lock_profit_enabled', e.target.checked)}
+                  id="trailingOptions"
                 />
               </div>
+              {/* AlgoTest: mode dropdown + both trailing value fields on one row */}
               <div className="flex gap-2">
-                <select 
-                  value={config.lock_profit_mode} 
-                  onChange={(e) => handleChange('lock_profit_mode', e.target.value)} 
-                  disabled={!config.lock_profit_enabled} 
-                  className="flex-1 min-w-0 px-3 py-3 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50"
+                <select
+                style={{ backgroundColor: colors.settingsPanel.activeBg, color: colors.settingsPanel.activeText, borderColor: colors.settingsPanel.activeBg, backgroundImage: selectChevron('white'), backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.6rem center' }}
+                  value={config.lock_profit_mode}
+                  onChange={(e) => handleChange('lock_profit_mode', e.target.value)}
+                  disabled={!config.lock_profit_enabled}
+                  className="appearance-none w-[8.5rem] pl-3.5 pr-8 h-8 text-[14px] border rounded-md font-normal outline-none transition-colors disabled:opacity-40"
                 >
-                  <option value="points">Points</option>
-                  <option value="percentage">Percentage</option>
+                  <option value="mtm">MTM</option>
+                  <option value="percent">Percent</option>
                 </select>
-                <input 
-                  type="number" 
+                <input
+                  type="number"
                   min="0"
                   step="0.01"
-                  value={config.lock_profit_value1 || ''} 
+                  value={config.lock_profit_value1 || ''}
                   onChange={(e) => {
                     const val = e.target.value;
                     if (val !== '' && Number(val) < 0) {
@@ -4263,16 +3418,16 @@ import logger from '../utils/logger';
                       return;
                     }
                     handleChange('lock_profit_value1', val);
-                  }} 
+                  }}
                   disabled={!config.lock_profit_enabled}
-                  className="flex-1 min-w-0 px-3 py-3 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50" 
-                  placeholder="0.00"
+                  className="w-20 px-3 h-8 text-[14px] border border-[#e3e3e3] rounded-md bg-white font-normal outline-none transition-colors disabled:opacity-40"
+                  placeholder="0"
                 />
-                <input 
-                  type="number" 
+                <input
+                  type="number"
                   min="0"
                   step="0.01"
-                  value={config.lock_profit_value2 || ''} 
+                  value={config.lock_profit_value2 || ''}
                   onChange={(e) => {
                     const val = e.target.value;
                     if (val !== '' && Number(val) < 0) {
@@ -4280,24 +3435,66 @@ import logger from '../utils/logger';
                       return;
                     }
                     handleChange('lock_profit_value2', val);
-                  }} 
+                  }}
                   disabled={!config.lock_profit_enabled}
-                  className="flex-1 min-w-0 px-3 py-3 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 hover:shadow-md focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 disabled:opacity-50" 
-                  placeholder="0.00"
+                  className="w-20 px-3 h-8 text-[14px] border border-[#e3e3e3] rounded-md bg-white font-normal outline-none transition-colors disabled:opacity-40"
+                  placeholder="0"
                 />
               </div>
             </div>
           </div>
+      </div>
+
+      <div data-pdf-block className="mx-0 mt-20 animate-fade-in"
+           style={{ fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" }}>
+        <div className="bg-white rounded-lg border px-6 py-5 flex items-center gap-6 flex-wrap"
+             style={{ borderColor: colors.settingsPanel.cardBorder }}>
+          <span className="text-[16px]" style={{ color: colors.settingsPanel.heading }}>
+            Enter the duration of your backtest
+          </span>
+
+          <span className="ml-auto flex items-center gap-6 flex-wrap">
+            <label className="flex items-center gap-3">
+              <span className="text-[13px] whitespace-nowrap" style={{ color: colors.settingsPanel.label }}>
+                Start Date
+              </span>
+              <DateSegmentInput
+                compact
+                value={config.start_date || ''}
+                onCommit={(v) => handleChange('start_date', v)}
+              />
+            </label>
+
+            <label className="flex items-center gap-3">
+              <span className="text-[13px] whitespace-nowrap" style={{ color: colors.settingsPanel.label }}>
+                End Date
+              </span>
+              <DateSegmentInput
+                compact
+                value={config.end_date || ''}
+                onCommit={(v) => handleChange('end_date', v)}
+              />
+            </label>
+          </span>
+        </div>
+
+        <div className="mt-5 rounded-lg border px-6 py-2.5 flex items-center justify-end gap-2"
+             style={{ backgroundColor: '#FAF0E6', borderColor: colors.settingsPanel.cardBorder }}>
+          <Info size={14} style={{ color: '#9A6B16' }} />
+          <span className="text-[13px] font-semibold" style={{ color: '#9A6B16' }}>
+            Latest Backtest data is available for {formatAdvisoryDate(DEFAULT_END_DATE)}
+          </span>
         </div>
       </div>
 
       {/* Backtest Results Section - Show inline after backtest completes */}
       {backtestResults && (
-        <div className="mt-8 mb-32">
+        <div className="mt-8 pb-32 bg-white">
           <BacktestResults 
             results={backtestResults} 
             onSaveStrategy={onSaveStrategy}
             strategyId={strategyId}
+            strategyName={config.strategy_name}
             strategySavedInSession={strategySavedInSession}
             onClearResults={onClearResults}
           />
@@ -4305,15 +3502,61 @@ import logger from '../utils/logger';
       )}
 
       {/* FIXED BOTTOM ACTION BAR */}
-      <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 shadow-2xl z-50">
+      <div data-builder-chrome="action-bar" className="ignore-pdf fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 shadow-[0_-1px_10px_rgba(0,0,0,0.05)] z-50">
         <div className="max-w-[1920px] mx-auto px-6 py-4">
           <div className="flex items-center justify-end gap-4">
-            {/* Action Buttons - Aligned to Right with Same Width */}
+            {strategyId && strategyId !== -999 && strategyId !== '-999' && (
+              <button
+                type="button"
+                onClick={() => {
+                  const legsErr = noLegsError(config);
+                  if (legsErr) {
+                    setResponsePopup({ type: 'error', title: legsErr });
+                    return;
+                  }
+
+                  const rangeErr = rangeBreakoutDteError(config);
+                  if (rangeErr) {
+                    setResponsePopup({ type: 'error', title: rangeErr });
+                    return;
+                  }
+
+                  const dayErr = positionalDayError(config.positional_entry_day, config.positional_exit_day);
+                  if (dayErr) { setResponsePopup({ type: 'error', title: dayErr }); return; }
+                  const expiryErr = positionalExpiryError();
+                  if (expiryErr) { setResponsePopup({ type: 'error', title: expiryErr }); return; }
+                  onSaveAsNew?.(latestConfigWithExtrasRef.current);
+                }}
+                className="flex items-center justify-center gap-2 px-4 py-3 h-[42px] shrink-0 border rounded transition-all duration-200 text-[12px] font-semibold bg-transparent"
+                style={{
+                  borderColor: colors.actionBar.secondaryBorder,
+                  color: colors.actionBar.secondaryText,
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.backgroundColor = colors.actionBar.secondaryHoverBg;
+                  e.currentTarget.style.color = 'white';
+                  e.currentTarget.style.borderColor = colors.actionBar.secondaryHoverBg;
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.backgroundColor = '#ffffff';
+                  e.currentTarget.style.color = colors.actionBar.secondaryText;
+                  e.currentTarget.style.borderColor = colors.actionBar.secondaryBorder;
+                  e.currentTarget.style.transform = 'scale(1)';
+                }}
+                onMouseDown={(e) => { e.currentTarget.style.transform = 'scale(0.95)'; }}
+                onMouseUp={(e) => { e.currentTarget.style.transform = 'scale(1)'; }}
+                title="Save these changes as a brand-new strategy"
+              >
+                <CopyPlus size={16} />
+                <span>Save As New</span>
+              </button>
+            )}
+
             {(() => {
+              const isUpdate = Boolean(strategyId && strategyId !== -999 && strategyId !== '-999');
               return (
-                <button 
+                <button
                   onClick={() => {
-                    
                     if (!isSaveButtonEnabled) {
                       setResponsePopup({ 
                         type: 'error', 
@@ -4322,22 +3565,47 @@ import logger from '../utils/logger';
                       return;
                     }
                     
-                    onSaveStrategy();
+                    const legsErr = noLegsError(config);
+                  if (legsErr) {
+                    setResponsePopup({ type: 'error', title: legsErr });
+                    return;
+                  }
+
+                  const rangeErr = rangeBreakoutDteError(config);
+                  if (rangeErr) {
+                    setResponsePopup({ type: 'error', title: rangeErr });
+                    return;
+                  }
+
+                  const dayErr = positionalDayError(config.positional_entry_day, config.positional_exit_day);
+                    if (dayErr) {
+                      setResponsePopup({ type: 'error', title: dayErr });
+                      return;
+                    }
+
+                    const expiryErr = positionalExpiryError();
+                    if (expiryErr) {
+                      setResponsePopup({ type: 'error', title: expiryErr });
+                      return;
+                    }
+
+                    onSaveStrategy({
+                      ...latestConfigWithExtrasRef.current,
+                      strategy_name: latestConfigWithExtrasRef.current.strategy_name || contextStrategyName,
+                    }, { viaUpdateButton: true });
                   }}
-                  className="flex items-center justify-center gap-2 w-44 p-4 border-2 rounded-lg hover:shadow-lg transition-all duration-200 font-medium save-strategy-btn"
+                  className="flex items-center justify-center gap-2 px-4 py-3 h-[42px] shrink-0 border rounded transition-all duration-200 text-[12px] font-semibold save-strategy-btn"
                   style={{
-                    borderColor: isSaveButtonEnabled ? '#2563eb' : '#9ca3af',
-                    color: isSaveButtonEnabled ? '#2563eb' : '#9ca3af',
-                    backgroundColor: 'transparent',
-                    opacity: isSaveButtonEnabled ? 1 : 0.6,
+                    borderColor: colors.actionBar.secondaryBorder,
+                    color: colors.actionBar.secondaryText,
+                    backgroundColor: '#ffffff',
+                    opacity: 1,
                     cursor: 'pointer'
                   }}
                   onMouseEnter={(e) => {
-                    if (isSaveButtonEnabled) {
-                      e.currentTarget.style.backgroundColor = '#004687';
-                      e.currentTarget.style.color = 'white';
-                      e.currentTarget.style.borderColor = '#004687';
-                    }
+                    e.currentTarget.style.backgroundColor = colors.actionBar.secondaryHoverBg;
+                    e.currentTarget.style.color = 'white';
+                    e.currentTarget.style.borderColor = colors.actionBar.secondaryHoverBg;
                   }}
                   onMouseDown={(e) => {
                     if (isSaveButtonEnabled) {
@@ -4350,26 +3618,21 @@ import logger from '../utils/logger';
                     }
                   }}
                   onMouseLeave={(e) => {
-                    if (isSaveButtonEnabled) {
-                      e.currentTarget.style.backgroundColor = 'transparent';
-                      e.currentTarget.style.color = '#2563eb';
-                      e.currentTarget.style.borderColor = '#2563eb';
-                      e.currentTarget.style.transform = 'scale(1)';
-                    } else {
-                      e.currentTarget.style.backgroundColor = 'transparent';
-                      e.currentTarget.style.transform = 'scale(1)';
-                    }
+                    e.currentTarget.style.backgroundColor = '#ffffff';
+                    e.currentTarget.style.color = colors.actionBar.secondaryText;
+                    e.currentTarget.style.borderColor = colors.actionBar.secondaryBorder;
+                    e.currentTarget.style.transform = 'scale(1)';
                   }}
                   title={
-                    !isSaveButtonEnabled 
-                      ? 'No changes to save' 
-                      : config.legs.length === 0 
-                        ? 'Add at least one leg before saving' 
+                    !isSaveButtonEnabled
+                      ? 'No changes to save'
+                      : config.legs.length === 0
+                        ? 'Add at least one leg before saving'
                         : 'Save this strategy'
                   }
                 >
                   <Save size={16} />
-                  Save Strategy
+                  {isUpdate ? 'Update' : 'Save Strategy'}
                 </button>
               );
             })()}
@@ -4380,14 +3643,20 @@ import logger from '../utils/logger';
             <button 
               onClick={handleSubmit}
               disabled={isLoading}
-              className="flex items-center justify-center gap-2 w-44 p-4 text-white rounded-lg hover:shadow-lg active:scale-95 transition-all duration-200 font-medium disabled:opacity-50 disabled:cursor-not-allowed"
-              style={{ backgroundColor: '#005A9C' }}
-              onMouseEnter={(e) => !isLoading && (e.currentTarget.style.backgroundColor = '#004580')}
-              onMouseLeave={(e) => !isLoading && (e.currentTarget.style.backgroundColor = '#005A9C')}
+              className="flex items-center justify-center gap-2 px-4 py-1 h-[42px] shrink-0 text-white rounded border active:scale-95 transition-all duration-200 text-[12px] font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
+              style={{ backgroundColor: colors.backtestButton.background }}
+              onMouseEnter={(e) => !isLoading && (e.currentTarget.style.backgroundColor = colors.backtestButton.hoverBackground)}
+              onMouseLeave={(e) => !isLoading && (e.currentTarget.style.backgroundColor = colors.backtestButton.background)}
               title=""
             >
-              <Play size={16} />
-              Start Backtest
+              {isLoading
+                ? <span className="w-[15px] h-[15px] rounded-full border-2 border-white/40 border-t-white animate-spin shrink-0" />
+                : <Play size={15} />}
+              <span className="flex flex-col items-center leading-tight">
+                <span>{isLoading ? 'Running Backtest' : 'Start Backtest'}</span>
+                {/* Wired below: Shift+Enter starts the backtest. */}
+                {!isLoading && <span className="text-[10px] font-normal opacity-90">(Shift+enter)</span>}
+              </span>
             </button>
             
             {/* Divider after Start Backtest - Only show when Compare button is visible */}
@@ -4395,16 +3664,38 @@ import logger from '../utils/logger';
               <div className="h-10 w-px bg-gray-300"></div>
             )}
             
-            {/* Compare Button - ONLY visible after user saves strategy in current session */}
-            {/* Hidden on page refresh, project restart, or when loading existing strategies */}
             {strategySavedInSession && (
-              <button 
+              <button
                 onClick={handleCompareBacktest}
                 disabled={loadingCompare}
-                className="flex items-center justify-center gap-2 px-6 py-3 border-2 border-blue-600 text-blue-600 bg-white rounded-lg hover:bg-blue-50 hover:shadow-lg active:scale-95 transition-all duration-200 font-medium disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-white"
+                className="flex items-center justify-center gap-2 px-4 py-3 h-[42px] shrink-0 border rounded transition-all duration-200 text-[12px] font-semibold bg-transparent disabled:opacity-50 disabled:cursor-not-allowed"
+                style={{
+                  borderColor: colors.actionBar.secondaryBorder,
+                  color: colors.actionBar.secondaryText,
+                  opacity: 1,
+                  cursor: 'pointer'
+                }}
+                onMouseEnter={(e) => {
+                  if (loadingCompare) return;
+                  e.currentTarget.style.backgroundColor = colors.actionBar.secondaryHoverBg;
+                  e.currentTarget.style.color = 'white';
+                  e.currentTarget.style.borderColor = colors.actionBar.secondaryHoverBg;
+                }}
+                onMouseDown={(e) => {
+                  if (!loadingCompare) e.currentTarget.style.transform = 'scale(0.95)';
+                }}
+                onMouseUp={(e) => {
+                  if (!loadingCompare) e.currentTarget.style.transform = 'scale(1)';
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.backgroundColor = '#ffffff';
+                  e.currentTarget.style.color = colors.actionBar.secondaryText;
+                  e.currentTarget.style.borderColor = colors.actionBar.secondaryBorder;
+                  e.currentTarget.style.transform = 'scale(1)';
+                }}
                 title="Compare this strategy with other backtests"
               >
-                <RefreshCw size={15} className={loadingCompare ? 'animate-spin' : ''} />
+                <ArrowRightLeft size={16} className={loadingCompare ? 'animate-pulse' : ''} />
                 {loadingCompare ? 'Loading...' : 'Compare Backtest'}
               </button>
             )}
@@ -4414,7 +3705,7 @@ import logger from '../utils/logger';
 
       {/* RANGE BREAKOUT MODAL */}
       {rangeBreakoutModal.isOpen && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
           <div className="bg-white rounded-2xl shadow-lg p-8 max-w-2xl w-full mx-4">
             {/* Header */}
             <div className="flex items-center justify-between mb-6">
@@ -4565,10 +3856,10 @@ import logger from '../utils/logger';
 
       {/* TIME PICKER MODAL */}
       {timePickerModal && (
-        <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50">
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
           <div className="bg-white rounded-2xl shadow-xl p-8 w-96">
             <div className="flex justify-between items-center mb-6">
-              <h2 className="text-2xl font-bold text-gray-800">Select Time (13:30 - 20:00)</h2>
+              <h2 className="text-2xl font-bold text-gray-800">Select Time (09:16 - 15:40)</h2>
               <button
                 onClick={() => setTimePickerModal(false)}
                 className="text-gray-400 hover:text-gray-600 hover:scale-125 hover:rotate-90 active:scale-90 text-2xl transition-all duration-200"
@@ -4607,7 +3898,7 @@ import logger from '../utils/logger';
             <div className="mb-8">
               <label className="text-gray-700 font-semibold text-lg mb-3 block">Quick Select</label>
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
-                {['13:30', '14:00', '14:30', '15:00', '15:30', '16:00', '17:00', '18:00', '19:00', '19:30', '20:00'].map((time) => (
+                {['13:30', '14:00', '14:30', '15:00','15:30', '15:40'].map((time) => (
                   <button
                     key={time}
                     onClick={() => {
@@ -4644,7 +3935,7 @@ import logger from '../utils/logger';
                   }
                   setTimePickerModal(false);
                 }}
-                style={{ backgroundColor: '#1565A0' }}
+                style={{ backgroundColor: colors.timePickerSelectButton.background }}
                 className="px-6 py-2 text-white font-semibold rounded-2xl hover:bg-blue-700 hover:shadow-lg hover:-translate-y-0.5 hover:scale-105 active:translate-y-0 active:scale-95 transition-all duration-200"
               >
                 Select
@@ -4658,19 +3949,25 @@ import logger from '../utils/logger';
       {/* Calendar Modal - Removed */}
 
       {/* ── Simple toast — shows backend response message ── */}
-      {responsePopup && (
-        <div className="fixed top-6 right-6 z-[200]" style={{ pointerEvents: 'auto' }}>
-          <div className={`flex items-center gap-3 px-5 py-3 rounded-lg shadow-lg text-white text-sm font-semibold ${
-            responsePopup.type === 'success' ? 'bg-green-600' : 
+            {responsePopup && (
+        <div className="fixed top-6 right-6 z-[200] animate-toast-in" style={{ pointerEvents: 'auto' }}>
+          <div className={`flex items-start gap-3 pl-4 pr-3 py-3 rounded-lg shadow-lg text-white text-[14px] font-medium min-w-[280px] max-w-[440px] ${
+            responsePopup.type === 'success' ? 'bg-green-600' :
             responsePopup.type === 'info' ? 'bg-blue-600' : 'bg-red-600'
           }`}>
             {responsePopup.type === 'success'
-              ? <svg xmlns="http://www.w3.org/2000/svg" className="w-5 h-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>
-              : responsePopup.type === 'info'
-              ? <svg xmlns="http://www.w3.org/2000/svg" className="w-5 h-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}><path strokeLinecap="round" strokeLinejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-              : <svg xmlns="http://www.w3.org/2000/svg" className="w-5 h-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}><path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+              ? <svg xmlns="http://www.w3.org/2000/svg" className="w-5 h-5 shrink-0 mt-px" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}><circle cx="12" cy="12" r="9" /><path strokeLinecap="round" strokeLinejoin="round" d="M8.5 12.5l2.5 2.5 4.5-5" /></svg>
+              : <svg xmlns="http://www.w3.org/2000/svg" className="w-5 h-5 shrink-0 mt-px" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}><circle cx="12" cy="12" r="9" /><path strokeLinecap="round" strokeLinejoin="round" d="M12 8h.01M12 11.5v4.5" /></svg>
             }
-            <span>{responsePopup.title}</span>
+            <span className="flex-1 leading-snug">{responsePopup.title}</span>
+            <button
+              type="button"
+              onClick={() => setResponsePopup(null)}
+              className="shrink-0 -mt-0.5 -mr-1 p-1 rounded hover:bg-white/20 transition-colors"
+              title="Dismiss"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}><path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+            </button>
           </div>
         </div>
       )}

@@ -1,6 +1,6 @@
-import React from 'react';
 import { Tooltip as ReactTooltip } from 'react-tooltip';
 import { HelpCircle } from 'lucide-react';
+import { colors } from '../theme/colors';
 
 const Tooltip = ({ id, content, children, place = "top" }) => {
   return (
@@ -13,13 +13,13 @@ const Tooltip = ({ id, content, children, place = "top" }) => {
         place={place}
         className="max-w-xs z-50"
         style={{
-          backgroundColor: '#1f2937',
-          color: '#fff',
+          backgroundColor: colors.tooltip.background,
+          color: colors.tooltip.text,
           borderRadius: '8px',
           padding: '8px 12px',
           fontSize: '13px',
           lineHeight: '1.4',
-          boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)'
+          boxShadow: colors.tooltip.shadow
         }}
       />
     </>

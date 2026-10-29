@@ -1,68 +1,284 @@
-import React, { useState, useEffect, useCallback, lazy, Suspense } from "react";
+import { useState, useEffect, useCallback, useRef, lazy } from "react";
 import { API_URL } from "./services/api"; // http://192.168.0.125:8000/api
 import Sidebar from "./components/Sidebar";
 import Header from "./components/Header";
+import TopBar from "./components/TopBar";
 import SaveStrategyModal from "./components/SaveStrategyModal";
-import BackgroundLoadingScreen from "./components/BackgroundLoadingScreen";
 import Toast from "./components/Toast";
-import { saveStrategy, buildSaveStrategyPayload, extractLegIdMapping } from "./services/strategyApi";
-import { saveStrategyToDatabase } from "./services/versionConfigApi";
+import { saveStrategy, updateStrategy, buildSaveStrategyPayload } from "./services/strategyApi";
 import { StrategyProvider, useStrategy } from "./context/StrategyContext";
 import { PortfolioProvider } from "./context/PortfolioContext";
+import { SavedStrategiesProvider, useSavedStrategies } from "./context/SavedStrategiesContext";
 import logger from './utils/logger';
+import { revealSection, INSTRUMENT_SECTION_ID } from './utils/revealSection';
+import { colors } from './theme/colors';
+import { ChevronsRight } from 'lucide-react';
+import LazyTab, { LazyTabBoundary } from './components/LazyTab';
+import SelectPopup from './components/SelectPopup';
+import AuthPage from './auth/AuthPage';
+import { hasValidSession, clearSession } from './auth/authSession';
+import { resetAttempts } from './auth/loginAttempts';
+import { decodeBackendStrategy } from './utils/backendStrategyDecode';
+import { resetAlgoTab } from './components/algotrade/tabMemory';
+import { fetchStrategies } from './services/libraryApi';
+import { refreshLibrary } from './services/strategyLibrary';
+import { subscribeLive } from './services/liveSocket';
+import useUrlTab, { initialTab } from './hooks/useUrlTab';
 
 // Lazy load heavy components (loaded only when needed)
 const StrategyBuilder = lazy(() => import("./components/StrategyBuilder"));
 const Reports = lazy(() => import("./components/Reports"));
-const LiveTradingDashboard = lazy(() => import("./components/LiveTradingDashboard"));
-const LiveTradingSettings = lazy(() => import("./components/LiveTradingSettings"));
-const AutoTradingMonitor = lazy(() => import("./components/AutoTradingMonitor"));
 const Portfolios = lazy(() => import("./components/Portfolios"));
 const SavedStrategiesList = lazy(() => import("./components/SavedStrategiesList"));
+const AlgoTrade = lazy(() => import("./components/AlgoTrade"));
 
-// Keep BacktestResults non-lazy (used within StrategyBuilder, needs to be immediately available)
-import BacktestResults from "./components/BacktestResults";
+
+// Shown only while a lazily-loaded tab's chunk is still arriving. The old
+// full-screen countdown overlay used to serve double duty here; backtest
+// progress now lives in the Start Backtest button instead.
+const TabFallback = () => (
+  <div className="flex items-center justify-center py-20">
+    <span className="w-6 h-6 rounded-full border-2 border-gray-200 border-t-gray-500 animate-spin" />
+  </div>
+);
 
 function App() {
+  // The signed-out screen stands in FRONT of the providers: until there is a
+  // session there is no strategy or portfolio work to hold, and mounting the
+  // whole app behind a sign-in page would run its localStorage hydration for
+  // nothing.
+  const [signedIn, setSignedIn] = useState(() => hasValidSession());
+  // Which view the auth page opens on: the landing page for a visitor, the
+  // login card for someone who has just signed out.
+  const [authView, setAuthView] = useState('landing');
+
+  // The 6-hour window can run out while the tab is open, so watch for it
+  // rather than only checking at mount. A minute's granularity is plenty and
+  // costs nothing; the exact expiry is enforced by readSession either way.
+  useEffect(() => {
+    if (!signedIn) return undefined;
+    const timer = setInterval(() => {
+      if (!hasValidSession()) setSignedIn(false);
+    }, 60 * 1000);
+    return () => clearInterval(timer);
+  }, [signedIn]);
+
+  if (!signedIn) {
+    return (
+      <>
+        <SelectPopup />
+        <AuthPage initialView={authView} onEnter={() => setSignedIn(true)} />
+      </>
+    );
+  }
+
+  // Signing out drops the session AND its token, then puts the login card up —
+  // not the landing page, so the next sign-in is one step away.
+  const handleLogout = () => {
+    resetAlgoTab();           // the next session starts on Strategies
+    clearSession();
+    resetAttempts();          // a new sign-in starts with all five attempts
+    setAuthView('login');
+    setSignedIn(false);
+  };
+
   return (
-    <StrategyProvider>
-      <PortfolioProvider>
-        <AppContent />
-      </PortfolioProvider>
-    </StrategyProvider>
+    <LazyTabBoundary fallback={<TabFallback />}>
+      {/* Inert unless the platform draws select lists badly — see SelectPopup. */}
+      <SelectPopup />
+      <StrategyProvider>
+        <SavedStrategiesProvider>
+        <PortfolioProvider>
+          <AppContent onLogout={handleLogout} />
+        </PortfolioProvider>
+        </SavedStrategiesProvider>
+      </StrategyProvider>
+    </LazyTabBoundary>
   );
 }
 
-function AppContent() {
+function AppContent({ onLogout }) {
   const { 
     strategy_id: contextStrategyId,
     strategy_name: contextStrategyName,
     version: contextVersion,
     updateStrategyData,
     getVersionByName,
-    isInitialized
+    clearStrategyData
   } = useStrategy();
+
+  // The saved strategies live here now — state mirrored to localStorage, so a
+  // save is visible to every screen at once and survives a refresh.
+  const { upsertStrategy, findByName, hasName } = useSavedStrategies();
   
-  const [activeTab, setActiveTab] = useState("builder");
-  const [backtestResults, setBacktestResults] = useState(null);
-  const [isLoading, setIsLoading] = useState(false);
-  const [backtestLoading, setBacktestLoading] = useState(false);
-  const [strategyConfig, setStrategyConfig] = useState({});
-  const [mainSidebarOpen, setMainSidebarOpen] = useState(true);
-  const [saveModalOpen, setSaveModalOpen] = useState(false);
-  const [currentStrategyId, setCurrentStrategyId] = useState(null);
-  const [showAutoTradingMonitor, setShowAutoTradingMonitor] = useState(false);
-  
+  /*
+    Seeded FROM THE URL so a refresh or a shared link opens the screen the
+    address bar names, not always the builder. `initialTab` falls back to
+    "builder" for "/" and for any path this build does not route.
+    The address bar is kept in step by useUrlTab, wired up further down --
+    it needs setAlgoEntry, which is declared below this line.
+  */
+  const [activeTab, setActiveTab] = useState(initialTab);
+
+  /**
+   * PART A -- ONE LIVE SOCKET PER SESSION.
+   *
+   * Every live subscriber sits inside Algo Trade, so leaving the tab dropped
+   * the count to zero and closed the socket; coming back opened a new one.
+   * This holds one subscription from the first visit until the app unmounts.
+   * Starts on first use, not at login. The callback does nothing on purpose --
+   * storing the snapshot here would re-render the whole app once a second.
+   */
+  const [liveEverOpened, setLiveEverOpened] = useState(false);
+
+  /*
+    Latched DURING RENDER, not in an effect: React's documented way to derive
+    state from a changed value, and the lint rule here rejects setState inside
+    an effect for exactly this (it costs an extra render pass). The guard makes
+    it run once and never loop.
+
+    The tab string is "algo-trade" -- the same literal the render below tests.
+  */
+  if (activeTab === "algo-trade" && !liveEverOpened) setLiveEverOpened(true);
+
   useEffect(() => {
-    
-    if (isInitialized) {
-      try {
-        const localData = JSON.parse(localStorage.getItem('strategy_session_data') || 'null');
-      } catch (e) {
-      }
+    if (!liveEverOpened) return undefined;
+    return subscribeLive(() => {});
+  }, [liveEverOpened]);
+  const [backtestResults, setBacktestResults] = useState(null);
+  /**
+   * TRUE ONLY WHILE A BACKTEST IS RUNNING. It drives the action bar's button,
+   * which reads "Running Backtest" while it is set.
+   *
+   * Loading a strategy used to set this too, so opening one from the sidebar
+   * flipped the button to "Running Backtest" without a backtest existing --
+   * obvious when clicking through saved strategies quickly, because the loads
+   * overlap and the label stuck. Strategy loading has its own flag below.
+   */
+  const [isLoading, setIsLoading] = useState(false);
+  /** True while a saved strategy is being fetched into the builder. */
+  const [isLoadingStrategy, setIsLoadingStrategy] = useState(false);
+  const [strategyConfig, setStrategyConfig] = useState({});
+  // Set only between a .algtst import and the builder taking it over; see
+  // handleImportStrategy for why the import cannot simply go into strategyConfig.
+  const [importedConfig, setImportedConfig] = useState(null);
+  // True for the instant a reset/load is replacing the strategy on screen; see
+  // handleConfigChange.
+  // Which generation of StrategyBuilder is the live one. Every reset bumps it,
+  // the builder is keyed AND stamped with it, and handleConfigChange drops any
+  // push that does not carry the current value — see there for why.
+  const [builderGeneration, setBuilderGeneration] = useState(0);
+  const generationRef = useRef(0);
+  // What StrategyBuilder has on screen right now, ahead of the debounced push
+  // into strategyConfig. Export reads this so it can never write a stale file.
+  const liveConfigRef = useRef(null);
+  // Stable wrapper around handleLoadStrategyFromBackend (which is rebuilt every
+  // render). Passing the raw function to a memoised screen would defeat its
+  // memo; this keeps one identity while always calling the current version.
+  const loadStrategyRef = useRef(null);
+  const openStrategyInBuilder = useCallback(
+    (strategyId, strategyName, version) => loadStrategyRef.current?.(strategyId, strategyName, version),
+    [],
+  );
+
+  // Deploy screen -> the app's own Portfolios screen, opened on the named
+  // portfolio's detail page. Stable identity, for the memoised AlgoTrade.
+  const [openPortfolioName, setOpenPortfolioName] = useState(null);
+  const goToPortfolios = useCallback((name) => {
+    setOpenPortfolioName(name || null);
+    setActiveTab('portfolios');
+  }, []);
+  const clearOpenPortfolio = useCallback(() => setOpenPortfolioName(null), []);
+
+  const beginStrategyReset = useCallback(() => {
+    // The ref is written here, in the event handler, and the updater below is
+    // left pure: React may call an updater more than once for a single update,
+    // and a ref bumped inside one ends up ahead of the state it mirrors — which
+    // would make every later push look stale and be dropped.
+    const next = generationRef.current + 1;
+    generationRef.current = next;
+    setBuilderGeneration(next);
+  }, []);
+  // True while the builder is showing a strategy that came from a file. The
+  // Import button hides then: importing over an import would throw away the
+  // strategy the user is in the middle of reviewing.
+  const [strategyImported, setStrategyImported] = useState(false);
+  // Open by default, but not on a window too narrow to hold both it and the
+  // page. Below ~980px the sidebar's ~165px is the difference between the
+  // tables fitting and their columns being crushed — on a rotated monitor with
+  // a half-width window the strategy NAME was squeezed to nothing.
+  //
+  // matchMedia, not a resize listener: it fires only when the threshold is
+  // actually crossed, so this costs nothing while the user drags a window, and
+  // a sidebar they open by hand on a narrow screen stays open.
+  const NARROW = '(max-width: 980px)';
+  const [mainSidebarOpen, setMainSidebarOpen] = useState(
+    () => !(typeof window !== 'undefined' && window.matchMedia?.(NARROW).matches),
+  );
+
+  useEffect(() => {
+    const mq = window.matchMedia?.(NARROW);
+    if (!mq) return undefined;
+    const onCross = (e) => { if (e.matches) setMainSidebarOpen(false); };
+    mq.addEventListener('change', onCross);
+    return () => mq.removeEventListener('change', onCross);
+  }, []);
+  // The sidebar's state is only ever changed by the user's own clicks — with
+  // one exception: the Pro view hides it (it brings a rail of its own) and
+  // leaving Pro restores whatever the user had. The stash lives in refs so the
+  // callbacks handed to the memoised AlgoTrade stay identity-stable.
+  const mainSidebarOpenRef = useRef(true);
+  useEffect(() => { mainSidebarOpenRef.current = mainSidebarOpen; });
+
+  // How the Algo Trade tab is entered: 'main' from the sidebar, 'broker' from
+  // the top bar's Broker Setup. The seq keys the component, so a Broker Setup
+  // click lands on the broker screen even when Algo Trade is already open.
+  const [algoEntry, setAlgoEntry] = useState({ view: 'main', seq: 0 });
+  const openBrokerSetup = useCallback(() => {
+    setAlgoEntry((was) => ({ view: 'broker', seq: was.seq + 1 }));
+    setActiveTab('algo-trade');
+  }, []);
+
+  /**
+   * The top bar's "Algo Trade" — always lands on the MAIN board.
+   *
+   * Plain setActiveTab did nothing when already on Algo Trade (same tab = no-op,
+   * so Broker Setup stayed up), and reopened on Broker Setup from elsewhere
+   * because `algoEntry.view` was still 'broker'. Bumping `seq` re-keys the
+   * component so it rebuilds either way; resetAlgoTab returns it to Strategies.
+   */
+  const openAlgoTrade = useCallback(() => {
+    resetAlgoTab();
+    setAlgoEntry((was) => ({ view: 'main', seq: was.seq + 1 }));
+    setActiveTab('algo-trade');
+  }, []);
+
+  /** Top-bar navigation. Algo Trade needs more than a tab switch; see above. */
+  const navigateFromTopBar = useCallback((tab) => {
+    if (tab === 'algo-trade') { openAlgoTrade(); return; }
+    setActiveTab(tab);
+  }, [openAlgoTrade]);
+
+  /**
+   * BACK / FORWARD. The browser has already changed the URL by the time this
+   * runs, so this only has to bring the screen into line with it.
+   *
+   * Algo Trade is re-entered on its MAIN board: Broker Setup shares the
+   * /algo-trade URL (it is a view inside the tab, not a route of its own), so
+   * without this, stepping back onto /algo-trade would reopen whichever inner
+   * screen was last shown rather than the board the URL stands for.
+   */
+  const applyTabFromHistory = useCallback((tab) => {
+    if (tab === 'algo-trade') {
+      resetAlgoTab();
+      setAlgoEntry((was) => ({ view: 'main', seq: was.seq + 1 }));
     }
-  }, [contextStrategyId, contextStrategyName, contextVersion, isInitialized]);
-  
+    setActiveTab(tab);
+  }, []);
+
+  useUrlTab(activeTab, applyTabFromHistory);
+  const [saveModalOpen, setSaveModalOpen] = useState(false);
+
   const [strategyId, setStrategyId] = useState(null);
   
   const [versionLoadCounter, setVersionLoadCounter] = useState(0);
@@ -75,6 +291,15 @@ function AppContent() {
   const [showToast, setShowToast] = useState(false);
   const [toastMessage, setToastMessage] = useState('');
   const [toastType, setToastType] = useState('success');
+
+  // One stable toast callback. AlgoTrade is memoised, so an inline arrow here
+  // would change identity every render and defeat the memo.
+  const notify = useCallback((message, type = 'success') => {
+    setToastMessage(message);
+    setToastType(type);
+    setShowToast(true);
+  }, []);
+
   
   const [strategySavedInSession, setStrategySavedInSession] = useState(false);
 
@@ -83,9 +308,7 @@ function AppContent() {
 
   const handleRunBacktest = async (payload) => {
     setIsLoading(true);
-    setBacktestLoading(true);
-    
-    
+
     try {
       if (!payload.strategy || !payload.legs) {
         throw new Error("Invalid payload structure: missing strategy or legs");
@@ -100,86 +323,54 @@ function AppContent() {
       });
 
       let data = null;
-      let usesMock = false;
 
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      const rawBody = await response.text();
+      let jsonData;
       try {
-        const response = await fetch(endpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
+        jsonData = rawBody ? JSON.parse(rawBody) : {};
+      } catch {
+        throw new Error(`Server returned invalid JSON (status ${response.status})`);
+      }
+
+      if (response.ok) {
+        data = jsonData;
+        
+        logger.response('[RUN BACKTEST] Response', { 
+          status: response.status,
+          data: data
         });
-
-        const rawBody = await response.text();
-        let jsonData;
-        try {
-          jsonData = rawBody ? JSON.parse(rawBody) : {};
-        } catch {
-          throw new Error(`Server returned invalid JSON (status ${response.status})`);
+        
+      } else {
+        const errorMessage = jsonData.error || jsonData.message || "Backend request failed";
+        logger.error("Backend Error Response:", jsonData);
+        logger.error("════════════════════════════════════════════════════════");
+        logger.error("BACKTEST FAILED");
+        logger.error("════════════════════════════════════════════════════════");
+        logger.error("Error:", errorMessage);
+        logger.error("Status Code:", response.status);
+        logger.error("Full Error Response:", JSON.stringify(jsonData, null, 2));
+        logger.error("════════════════════════════════════════════════════════");
+        
+        if (errorMessage.toLowerCase().includes('no chain data') || 
+            errorMessage.toLowerCase().includes('no data found')) {
+          // Single line: this surfaces in a toast now, not a native alert box.
+          throw new Error(
+            `No trading data found for ${payload.strategy.start_date} to ${payload.strategy.end_date}. Check the dates and click "Load Data" first.`
+          );
         }
-
-        if (response.ok) {
-          data = jsonData;
-          
-          logger.response('[RUN BACKTEST] Response', { 
-            status: response.status,
-            data: data
-          });
-          
-          if (data.date_range) {
-          }
-          if (data.start_date && data.end_date) {
-          }
-          
-          
-          const tradeResults = data?.data?.trade_results || data?.data?.tradeResults || [];
-          if (tradeResults.length > 0) {
-            const firstTrade = tradeResults[0];
-            if (firstTrade.legs && firstTrade.legs.length > 0) {
-              firstTrade.legs.forEach((leg, idx) => {
-              });
-            }
-          }
-          
-          if (Array.isArray(data.data) && data.data.length > 0) {
-          }
-          if (data.results) {
-          }
-        } else {
-          const errorMessage = jsonData.error || jsonData.message || "Backend request failed";
-          logger.error("❌ Backend Error Response:", jsonData);
-          logger.error("════════════════════════════════════════════════════════");
-          logger.error("❌ BACKTEST FAILED");
-          logger.error("════════════════════════════════════════════════════════");
-          logger.error("Error:", errorMessage);
-          logger.error("Status Code:", response.status);
-          logger.error("Full Error Response:", JSON.stringify(jsonData, null, 2));
-          logger.error("════════════════════════════════════════════════════════");
-          
-          if (errorMessage.toLowerCase().includes('no chain data') || 
-              errorMessage.toLowerCase().includes('no data found')) {
-            throw new Error(
-              `No trading data found for the selected date range.\n\n` +
-              `Requested: ${payload.strategy.start_date} to ${payload.strategy.end_date}\n\n` +
-              `Please verify:\n` +
-              `1. The selected dates are correct\n` +
-              `2. Data has been loaded for this date range\n` +
-              `3. Click "Load Data" button before running backtest`
-            );
-          }
-          
-          throw new Error(errorMessage);
-        }
-      } catch (backendError) {
-        usesMock = true;
-
-        data = generateMockBacktestResults(payload);
+        
+        throw new Error(errorMessage);
       }
 
       if (data.status === "error" || data.error) {
         throw new Error(data.error || "Backtest failed");
       }
-
-      // Removed 60-second artificial delay for mock results
 
       let resultsToSet = data;
       if (data.results && !data.data) {
@@ -192,150 +383,48 @@ function AppContent() {
       // This triggers compare data refresh in StrategyBuilder
       console.log('[App] Backtest completed, incrementing backtestCompletedCounter');
       setBacktestCompletedCounter(prev => prev + 1);
-
-      if (usesMock) {
-      }
     } catch (error) {
       logger.error("Backtest failed:", error);
-      alert(`Backtest failed: ${error.message}\n\nCheck browser console (F12) for details.`);
+      // Red toast instead of a native alert() — the browser draws alert() as a
+      // "localhost says" dialog that cannot be styled and looks different on
+      // every OS. The console still gets the full error via logger.error above.
+      setToastMessage(`Backtest failed: ${error.message}`);
+      setToastType('error');
+      setShowToast(true);
     } finally {
-      setBacktestLoading(false);
       setIsLoading(false);
     }
   };
 
-  const generateMockBacktestResults = (payload) => {
-    const legsCount = payload.legs?.length || 1;
-    const totalTrades = Math.floor(Math.random() * 100) + 20;
-    const winningTrades = Math.floor(totalTrades * 0.65);
-    const losingTrades = totalTrades - winningTrades;
-    
-    const startDate = new Date(payload.strategy.start_date);
-    const endDate = new Date(payload.strategy.end_date);
-    const initialCapital = payload.strategy.initial_capital || 50000;
-    
-    const trades = [];
-    for (let i = 0; i < totalTrades; i++) {
-      const isWin = i < winningTrades;
-      const pnl = isWin 
-        ? Math.floor(Math.random() * 2000) + 500
-        : -(Math.floor(Math.random() * 1000) + 200);
-      
-      trades.push({
-        trade_id: i + 1,
-        entry_date: new Date(startDate.getTime() + Math.random() * (endDate.getTime() - startDate.getTime())).toISOString().split('T')[0],
-        entry_time: `${String(Math.floor(Math.random() * 6) + 9).padStart(2, '0')}:${String(Math.floor(Math.random() * 60)).padStart(2, '0')}`,
-        entry_price: 100 + Math.random() * 50,
-        exit_time: `${String(Math.floor(Math.random() * 6) + 14).padStart(2, '0')}:${String(Math.floor(Math.random() * 60)).padStart(2, '0')}`,
-        exit_price: 100 + Math.random() * 50,
-        quantity: payload.legs[0]?.lot_size || 100,
-        pnl: pnl,
-        return_percent: (pnl / initialCapital) * 100,
-        win: isWin,
-      });
-    }
+  const handleConfigChange = useCallback((config, generation) => {
+    // StrategyBuilder flushes whatever it has pending when it unmounts. If the
+    // unmount was caused by a deliberate reset — "New Strategy", opening a
+    // saved strategy, loading one from a report — that flush arrives AFTER the
+    // new config was set and would put the old strategy straight back: clicking
+    // "New Strategy" left the form showing the strategy it had just left.
+    //
+    // Every builder is mounted for one generation (versionLoadCounter, which
+    // also keys it) and stamps its pushes with it, so a push from the builder
+    // being torn down is recognised and dropped. This used to be a one-tick
+    // timer instead, which the import path outran: the remount commit landed
+    // after the tick, the flush was let through, and "New Strategy" after an
+    // import showed the imported strategy again.
+    if (generation !== undefined && generation !== generationRef.current) return;
 
-    const totalPnl = trades.reduce((sum, t) => sum + t.pnl, 0);
-    const avgWin = trades.filter(t => t.win).reduce((sum, t) => sum + t.pnl, 0) / winningTrades || 0;
-    const avgLoss = trades.filter(t => !t.win).reduce((sum, t) => sum + t.pnl, 0) / losingTrades || 0;
-
-    const monthlyStats = {};
-    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-    const years = ['2025', '2026'];
-    
-    years.forEach(year => {
-      if (!monthlyStats[year]) {
-        monthlyStats[year] = {};
-      }
-      months.forEach(month => {
-        const isWinMonth = Math.random() > 0.5;
-        if (isWinMonth) {
-          monthlyStats[year][month] = Math.floor(Math.random() * 15000) + 1000;
-        } else {
-          monthlyStats[year][month] = -(Math.floor(Math.random() * 2000) + 500);
-        }
-      });
-    });
-
-    const cumulativeData = [];
-    let cumulativePnl = 0;
-    let currentPrice = 25000;
-    
-    for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
-      cumulativePnl += (Math.random() * 2000 - 500);
-      currentPrice += (Math.random() * 500 - 200);
-      
-      cumulativeData.push({
-        date: d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: '2-digit' }),
-        timestamp: new Date(d).getTime(),
-        cumulativePnl: Math.max(0, cumulativePnl),
-        underlyingValue: Math.max(20000, currentPrice),
-      });
-    }
-
-    const drawdownData = [];
-    let peakValue = 0;
-    for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
-      peakValue = Math.max(peakValue, cumulativePnl);
-      const drawdown = peakValue - cumulativePnl;
-      drawdownData.push({
-        date: d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: '2-digit' }),
-        timestamp: new Date(d).getTime(),
-        drawdown: -Math.abs(drawdown),
-      });
-      cumulativePnl += (Math.random() * 2000 - 500);
-    }
-
-    return {
-      status: "success",
-      results: {
-        trades: trades,
-        monthly_stats: monthlyStats,
-        cumulative_data: cumulativeData,
-        drawdown_data: drawdownData,
-        summary: {
-          total_trades: totalTrades,
-          winning_trades: winningTrades,
-          losing_trades: losingTrades,
-          win_rate: (winningTrades / totalTrades * 100).toFixed(2),
-          total_pnl: totalPnl.toFixed(2),
-          average_win: avgWin.toFixed(2),
-          average_loss: avgLoss.toFixed(2),
-          profit_factor: (Math.abs(avgWin / avgLoss) || 0).toFixed(2),
-          max_drawdown: -(Math.floor(Math.random() * 5000) + 1000),
-          sharpe_ratio: (Math.random() * 2 + 0.5).toFixed(2),
-          total_return: ((totalPnl / initialCapital) * 100).toFixed(2),
-          num_legs: legsCount,
-          strategy_type: payload.strategy.strategy_type || 'INTRADAY',
-          symbol: payload.strategy.symbol || 'SPXW',
-          period: `${payload.strategy.start_date} - ${payload.strategy.end_date}`,
-          overall_profit: 16467.75,
-          no_of_trades: 223,
-          avg_profit_per_trade: 73.85,
-          win_percentage: 224,
-          loss_percentage: 97.78,
-          max_profit_single_trade: 7559.50,
-          max_loss_single_trade: -65.00,
-          max_drawdown_trade: -9425.00,
-          days_in_max_drawdown: '240 (2025-11-06 to 2026-07-03)',
-          avg_loss_losing_trades: -65.00,
-          return_to_maxdd: 1.75,
-          reward_to_risk: 94.27,
-          expectancy_ratio: 1.14,
-          max_win_streak: 1,
-          max_loss_streak: 145,
-          no_of_trades_in_max_dd: 144,
-        }
-      }
-    };
-  };
-
-  const handleConfigChange = useCallback((config) => {
     setStrategyConfig(config);
+    // An import hands the builder its config directly (see handleImportStrategy).
+    // The moment the builder pushes a config with legs back, it owns the
+    // imported strategy and strategyConfig is in step, so the override goes.
+    setImportedConfig((pending) => (pending && config?.legs?.length ? null : pending));
   }, []);
 
   const handleLoadConfigFromReport = (config) => {
+    beginStrategyReset();
     setStrategyConfig(config);
+    setImportedConfig(null);   // see handleCreateNewStrategy
+    // Same reason as handleLoadStrategyFromBackend: don't carry another run's
+    // results into a config that was just loaded from a report.
+    setBacktestResults(null);
     setTimeout(() => {
       setActiveTab("builder");
     }, 0);
@@ -344,7 +433,7 @@ function AppContent() {
   const handleLoadStrategyFromBackend = async (strategyId, strategyName, specificVersion = null) => {
     try {
       
-      setIsLoading(true);
+      setIsLoadingStrategy(true);
       
       let versionToRequest = specificVersion; // Use specific version if provided
       
@@ -356,13 +445,23 @@ function AppContent() {
           logger.request('[GET STRATEGY] Version from context', { contextVersion, contextStrategyId, contextStrategyName });
         }
         
-        // Priority 2: Check version map in localStorage for this strategy name
+        // Priority 2: the saved strategy itself. Its card carries the id and the
+        // version the backend last returned for this name, which is exactly
+        // what this request needs — and it comes from context, so it is current
+        // even for a strategy saved moments ago on another screen.
+        if (versionToRequest === null && strategyName) {
+          versionToRequest = findByName(strategyName)?.version ?? null;
+          logger.request('[GET STRATEGY] Version from the saved strategy', { strategyName, version: versionToRequest });
+        }
+
+        // Priority 3: the older name -> version map, for cards saved before
+        // versions were kept on them.
         if (versionToRequest === null && strategyName) {
           versionToRequest = getVersionByName(strategyName);
           logger.request('[GET STRATEGY] Version from VERSION_MAP', { strategyName, version: versionToRequest });
         }
         
-        // Priority 3: Check strategy_session_data as last resort
+        // Priority 4: Check strategy_session_data as last resort
         if (versionToRequest === null) {
           try {
             const storedData = JSON.parse(localStorage.getItem('strategy_session_data') || '{}');
@@ -370,8 +469,29 @@ function AppContent() {
               versionToRequest = storedData.version;
               logger.request('[GET STRATEGY] Version from strategy_session_data', { storedData });
             }
-          } catch (e) {
+          } catch {
             // localStorage read failed, continue without version
+          }
+        }
+
+        // Priority 5: ASK THE BACKEND.
+        //
+        // Every lookup above reads localStorage — the context, the saved cards,
+        // the name->version map, the session blob. All four are written on the
+        // machine that saved the strategy, so on any OTHER machine they return
+        // null together, the request went out with no `version` at all, and the
+        // backend rejected it (422). The strategies list carries the current
+        // version and reads the same everywhere, so it is the one source that
+        // cannot go missing.
+        if (versionToRequest === null) {
+          try {
+            const rows = await fetchStrategies();
+            const match = rows.find((r) => String(r.id) === String(strategyId))
+              || rows.find((r) => String(r.name).trim() === String(strategyName ?? '').trim());
+            versionToRequest = match?.version ?? null;
+            logger.request('[GET STRATEGY] Version from the backend list', { strategyName, version: versionToRequest });
+          } catch (listError) {
+            logger.error('[GET STRATEGY] Could not read the strategy list for a version', listError);
           }
         }
       }
@@ -380,9 +500,13 @@ function AppContent() {
       
       let apiUrl = `${API_URL}/get-strategy?strategy_id=${encodeURIComponent(strategyId)}&strategy_name=${encodeURIComponent(strategyName)}`;
       
-      if (versionToRequest !== null) {
-        apiUrl += `&version=${versionToRequest}`;
+      // ALWAYS send a version. Leaving it off is what produced the 422: the
+      // backend treats it as required. 1 is only ever reached when the backend
+      // list itself could not supply one, so it is logged rather than silent.
+      if (versionToRequest === null) {
+        logger.error('[GET STRATEGY] No version could be resolved; falling back to 1', { strategyId, strategyName });
       }
+      apiUrl += `&version=${versionToRequest ?? 1}`;
       
       logger.request('[GET STRATEGY] Request', { 
         method: 'GET',
@@ -417,741 +541,53 @@ function AppContent() {
         throw new Error(result.error || 'Failed to load strategy data');
       }
 
-      const { strategy, legs, unselected_legs } = result.data;
-      
-      const formatTypeForUI = (backendType) => {
-        if (!backendType) return 'points';
-        const upper = String(backendType).toUpperCase();
-        
-        if (upper === 'PERCENT') return 'percentage';
-        if (upper === 'UNDERLYING_PERCENT') return 'underlying_percentage';
-        if (upper === 'POINTS') return 'points';
-        if (upper === 'UNDERLYING_POINTS') return 'underlying_points';
-        if (upper === 'MTM') return 'mtm';
-        
-        return String(backendType).toLowerCase();
-      };
-      
+      const { strategy } = result.data;
+
       const versionNumber = strategy.version || result.data.version || 1;
 
       updateStrategyData(strategyId, strategyName, versionNumber);
       logger.context('Strategy data stored', { strategyId, strategyName, version: versionNumber });
 
-      
-      const transformedLegs = (legs || []).filter(leg => leg.is_selected !== false).map(leg => {
-        
-        const transformed = {
-          ...leg,
-          
-          id: leg.leg_id, // Frontend uses 'id' for leg identification
-          isLazyLeg: leg.is_lazy_leg || false, // Mark if this is a lazy leg
-          isSequentialLeg: leg.leg_name && leg.leg_name.startsWith('SEQ#'),
-          sequentialLegNumber: leg.leg_name && leg.leg_name.startsWith('SEQ#') 
-            ? parseInt(leg.leg_name.replace('SEQ#', '')) 
-            : undefined,
-          parentLegIndex: leg.parent_leg_index !== undefined ? leg.parent_leg_index : undefined,
-          customName: leg.leg_name || '', // Lazy leg name or Sequential leg name
-          is_selected: leg.is_selected, // Keep backend flag for reference
-          
-          lots: String(leg.lot_size || 1),  // Backend: lot_size (number) → Frontend: lots (string)
-          position: leg.position_type?.toLowerCase() || 'buy',  // Backend: position_type → Frontend: position
-          option_type: leg.option_type?.toLowerCase() || 'call',  // Case conversion
-          expiry: leg.expiry_type || '0dte',
-          
-          stop_loss_enabled: leg.is_stoploss || false,
-          stop_loss_mode: formatTypeForUI(leg.stoploss_type),
-          stop_loss_value: leg.stoploss_value || '',
-          
-          trail_enabled: leg.is_trail_sl || false,
-          trail_mode: formatTypeForUI(leg.trail_sl_type),
-          trail_value: leg.instrument_moves || '',  // Fixed: instrument_moves (plural)
-          trail_lock_value: leg.stoploss_moves || '',  // Fixed: stoploss_moves (plural)
-          
-          target_enabled: leg.is_target || false,
-          target_mode: formatTypeForUI(leg.target_type),
-          target_value: leg.target_value || '',
-          
-          reentry_sl_enabled: leg.is_reentry_sl || false,
-          reentry_sl_mode: leg.reentry_sl_type?.toUpperCase() === 'LAZY_LEG' 
-            ? 'LAZY_LEG' 
-            : leg.reentry_sl_type?.toLowerCase() || 're_asap',
-          reentry_sl_count: leg.reentry_sl_value || '',
-          reentry_sl_lazy_leg_id: leg.reentry_sl_type?.toUpperCase() === 'LAZY_LEG' ? leg.reentry_sl_value : null, // Store the leg_id reference
-          
-          reentry_tgt_enabled: leg.is_reentry_target || false,
-          reentry_tgt_mode: leg.reentry_target_type?.toUpperCase() === 'LAZY_LEG' 
-            ? 'LAZY_LEG' 
-            : leg.reentry_target_type?.toLowerCase() || 're_asap',
-          reentry_tgt_count: leg.reentry_target_value || '',
-          reentry_tgt_lazy_leg_id: leg.reentry_target_type?.toUpperCase() === 'LAZY_LEG' ? leg.reentry_target_value : null, // Store the leg_id reference
-          
-          momentum_enabled: leg.is_simple_momentum || false,
-          momentum_mode: leg.momentum_type?.toLowerCase() || 'percent_up',
-          momentum_value: leg.momentum_value || '',
-          
-          ...(!leg.is_lazy_leg && {
-            range_enabled: leg.is_range_breakout || false,
-            range_instrument: leg.range_breakout_type?.toLowerCase() || 'instrument',
-            range_time: leg.range_end_time || null,
-            range_direction: leg.range_on?.toLowerCase() || 'high',
-          }),
-          
-          strike_criteria: leg.strike_criteria === 'atm percentage' 
-            ? 'based on atm percent' 
-            : leg.strike_criteria === 'premium range'
-            ? 'based on premium range'
-            : (leg.strike_criteria || 'strike_type'),
-          atm_strike: leg.atm_strike || 'ATM',  // Keep backend format "ITM-17"
-          strike_value: leg.premium_value || '',
-          closest_premium_value: leg.premium_value || '',  // For "Based On Closest Premium"
-          lower_range: leg.lower_range || '',  // For "Based On premium range"
-          upper_range: leg.upper_range || '',  // For "Based On premium range"
-          atm_percent_direction: leg.strike_sign || '+',
-          atm_percent_value: leg.multiplier_percentage || '',
-        };
-        
-        if (transformed.isSequentialLeg) {
-        }
-        
-        if (transformed.isLazyLeg) {
-        }
-        
-        
-        return transformed;
-      });
+      // The response -> config mapping lives in backendStrategyDecode (one
+      // decoder, shared with the portfolio export). See that module.
+      const loadedConfig = decodeBackendStrategy(result.data, strategyName);
 
-      // Build lazy leg ID map: leg_id → frontend id
-      const lazyLegIdMap = {};
-      transformedLegs.forEach(leg => {
-        if (leg.isLazyLeg && leg.leg_id) {
-          lazyLegIdMap[leg.leg_id] = leg.id;
-        }
-      });
-
-      // Convert LAZY_LEG references to lazy_leg_${id} format
-      transformedLegs.forEach(leg => {
-        if (leg.reentry_sl_mode === 'LAZY_LEG' && leg.reentry_sl_lazy_leg_id) {
-          const frontendLazyLegId = lazyLegIdMap[leg.reentry_sl_lazy_leg_id];
-          if (frontendLazyLegId) {
-            leg.reentry_sl_mode = `lazy_leg_${frontendLazyLegId}`;
-          }
-        }
-        if (leg.reentry_tgt_mode === 'LAZY_LEG' && leg.reentry_tgt_lazy_leg_id) {
-          const frontendLazyLegId = lazyLegIdMap[leg.reentry_tgt_lazy_leg_id];
-          if (frontendLazyLegId) {
-            leg.reentry_tgt_mode = `lazy_leg_${frontendLazyLegId}`;
-          }
-        }
-      });
-
-      
-      const extractedLazyLegs = [];
-      const extractedLazyLegIds = new Set(); // Track which lazy legs we've extracted
-      
-      const extractNestedLazyLeg = (parentLeg, originalParentLeg) => {
-        if (originalParentLeg && originalParentLeg.lazy_leg) {
-          const lazyLeg = originalParentLeg.lazy_leg;
-          
-          if (extractedLazyLegIds.has(lazyLeg.leg_id)) {
-            return;
-          }
-          
-          
-          const transformedLazyLeg = {
-            ...lazyLeg,
-            id: lazyLeg.leg_id, // Frontend uses 'id'
-            isLazyLeg: true,
-            customName: lazyLeg.leg_name || '',
-            is_selected: true, // Nested lazy legs are always selected
-            
-            lots: String(lazyLeg.lot_size || 1),
-            position: lazyLeg.position_type?.toLowerCase() || 'buy',
-            option_type: lazyLeg.option_type?.toLowerCase() || 'call',
-            expiry: lazyLeg.expiry_type || '0dte',
-            
-            stop_loss_enabled: lazyLeg.is_stoploss || false,
-            stop_loss_mode: formatTypeForUI(lazyLeg.stoploss_type),
-            stop_loss_value: lazyLeg.stoploss_value || '',
-            
-            trail_enabled: lazyLeg.is_trail_sl || false,
-            trail_mode: formatTypeForUI(lazyLeg.trail_sl_type),
-            trail_value: lazyLeg.instrument_moves || '',
-            trail_lock_value: lazyLeg.stoploss_moves || '',
-            
-            target_enabled: lazyLeg.is_target || false,
-            target_mode: formatTypeForUI(lazyLeg.target_type),
-            target_value: lazyLeg.target_value || '',
-            
-            reentry_sl_enabled: lazyLeg.is_reentry_sl || false,
-            reentry_sl_mode: lazyLeg.reentry_sl_type?.toUpperCase() === 'LAZY_LEG' 
-              ? 'LAZY_LEG'  // Will be converted to lazy_leg_${id} later if nested
-              : lazyLeg.reentry_sl_type?.toLowerCase() || 're_asap',
-            reentry_sl_count: lazyLeg.reentry_sl_value || '',
-            
-            reentry_tgt_enabled: lazyLeg.is_reentry_target || false,
-            reentry_tgt_mode: lazyLeg.reentry_target_type?.toUpperCase() === 'LAZY_LEG'
-              ? 'LAZY_LEG'  // Will be converted to lazy_leg_${id} later if nested
-              : lazyLeg.reentry_target_type?.toLowerCase() || 're_asap',
-            reentry_tgt_count: lazyLeg.reentry_target_value || '',
-            
-            momentum_enabled: lazyLeg.is_simple_momentum || false,
-            momentum_mode: lazyLeg.momentum_type?.toLowerCase() || 'percent_up',
-            momentum_value: lazyLeg.momentum_value || '',
-            
-            strike_criteria: lazyLeg.strike_criteria === 'atm percentage'
-              ? 'based on atm percent'
-              : lazyLeg.strike_criteria === 'premium range'
-              ? 'based on premium range'
-              : (lazyLeg.strike_criteria || 'strike_type'),
-            atm_strike: lazyLeg.atm_strike || 'ATM',
-            strike_value: lazyLeg.premium_value || '',
-            closest_premium_value: lazyLeg.premium_value || '',  // For "Based On Closest Premium"
-            lower_range: lazyLeg.lower_range || '',  // For "Based On premium range"
-            upper_range: lazyLeg.upper_range || '',  // For "Based On premium range"
-            atm_percent_direction: lazyLeg.strike_sign || '+',
-            atm_percent_value: lazyLeg.multiplier_percentage || '',
-          };
-          
-          extractedLazyLegs.push(transformedLazyLeg);
-          extractedLazyLegIds.add(lazyLeg.leg_id);
-          
-          if (parentLeg.reentry_sl_mode === 'LAZY_LEG') {
-            parentLeg.reentry_sl_mode = `lazy_leg_${transformedLazyLeg.id}`;
-          }
-          if (parentLeg.reentry_tgt_mode === 'LAZY_LEG') {
-            parentLeg.reentry_tgt_mode = `lazy_leg_${transformedLazyLeg.id}`;
-          }
-          
-          extractNestedLazyLeg(transformedLazyLeg, lazyLeg);
-        }
-      };
-      
-      (legs || []).forEach((originalLeg, index) => {
-        if (transformedLegs[index]) {
-          extractNestedLazyLeg(transformedLegs[index], originalLeg);
-        }
-      });
-      
-      if (extractedLazyLegs.length > 0) {
-        transformedLegs.push(...extractedLazyLegs);
-      }
-      
-      transformedLegs.forEach((leg, legIndex) => {
-        if (leg.reentry_sl_enabled && leg.reentry_sl_mode === 'LAZY_LEG') {
-          const linkedLegId = leg.reentry_sl_count || legs[legIndex]?.reentry_sl_value;
-          if (linkedLegId) {
-            leg.reentry_sl_mode = `lazy_leg_${linkedLegId}`;
-          }
-        }
-        
-        if (leg.reentry_tgt_enabled && leg.reentry_tgt_mode === 'LAZY_LEG') {
-          const linkedLegId = leg.reentry_tgt_count || legs[legIndex]?.reentry_target_value;
-          if (linkedLegId) {
-            leg.reentry_tgt_mode = `lazy_leg_${linkedLegId}`;
-          }
-        }
-      });
-      
-      const extractedSequentialLegs = [];
-      
-      const extractSequentialLeg = (parentLeg, originalParentLeg, parentIndex) => {
-        if (originalParentLeg && originalParentLeg.sequential_leg) {
-          const seqLeg = originalParentLeg.sequential_leg;
-          
-          
-          const transformedSeqLeg = {
-            ...seqLeg,
-            id: seqLeg.leg_id || Date.now() + Math.random(), // Generate ID if not provided
-            isSequentialLeg: true,
-            customName: seqLeg.leg_name || '',
-            sequentialLegNumber: seqLeg.leg_name && seqLeg.leg_name.startsWith('SEQ#')
-              ? parseInt(seqLeg.leg_name.replace('SEQ#', ''))
-              : undefined,
-            parentLegIndex: parentIndex, // Link to parent main leg index
-            
-            lots: String(seqLeg.lot_size || 1),
-            position: seqLeg.position_type?.toLowerCase() || 'buy',
-            option_type: seqLeg.option_type?.toLowerCase() || 'call',
-            expiry: seqLeg.expiry_type || '0dte',
-            
-            stop_loss_enabled: seqLeg.is_stoploss || false,
-            stop_loss_mode: formatTypeForUI(seqLeg.stoploss_type),
-            stop_loss_value: seqLeg.stoploss_value !== null && seqLeg.stoploss_value !== undefined 
-              ? String(seqLeg.stoploss_value) 
-              : '',
-            
-            trail_enabled: seqLeg.is_trail_sl || false,
-            trail_mode: formatTypeForUI(seqLeg.trail_sl_type),
-            trail_value: seqLeg.instrument_moves !== null && seqLeg.instrument_moves !== undefined 
-              ? String(seqLeg.instrument_moves) 
-              : '',
-            trail_lock_value: seqLeg.stoploss_moves !== null && seqLeg.stoploss_moves !== undefined 
-              ? String(seqLeg.stoploss_moves) 
-              : '',
-            
-            target_enabled: seqLeg.is_target || false,
-            target_mode: formatTypeForUI(seqLeg.target_type),
-            target_value: seqLeg.target_value !== null && seqLeg.target_value !== undefined 
-              ? String(seqLeg.target_value) 
-              : '',
-            
-            reentry_sl_enabled: seqLeg.is_reentry_sl || false,
-            reentry_sl_mode: seqLeg.reentry_sl_type?.toLowerCase() || 're_asap',
-            reentry_sl_count: seqLeg.reentry_sl_value !== null && seqLeg.reentry_sl_value !== undefined 
-              ? String(seqLeg.reentry_sl_value) 
-              : '',
-            
-            reentry_tgt_enabled: seqLeg.is_reentry_target || false,
-            reentry_tgt_mode: seqLeg.reentry_target_type?.toLowerCase() || 're_asap',
-            reentry_tgt_count: seqLeg.reentry_target_value !== null && seqLeg.reentry_target_value !== undefined 
-              ? String(seqLeg.reentry_target_value) 
-              : '',
-            
-            momentum_enabled: seqLeg.is_simple_momentum || false,
-            momentum_mode: seqLeg.momentum_type?.toLowerCase() || 'percent_up',
-            momentum_value: seqLeg.momentum_value !== null && seqLeg.momentum_value !== undefined 
-              ? String(seqLeg.momentum_value) 
-              : '',
-            
-            range_enabled: seqLeg.is_range_breakout || false,
-            range_instrument: seqLeg.range_breakout_type?.toLowerCase() || 'instrument',
-            range_time: seqLeg.range_end_time || null,
-            range_direction: seqLeg.range_on?.toLowerCase() || 'high',
-            
-            strike_criteria: seqLeg.strike_criteria === 'atm percentage'
-              ? 'based on atm percent'
-              : seqLeg.strike_criteria === 'premium range'
-              ? 'based on premium range'
-              : (seqLeg.strike_criteria || 'strike_type'),
-            atm_strike: seqLeg.atm_strike || 'ATM',
-            strike_value: seqLeg.premium_value !== null && seqLeg.premium_value !== undefined 
-              ? String(seqLeg.premium_value) 
-              : '',
-            closest_premium_value: seqLeg.premium_value !== null && seqLeg.premium_value !== undefined 
-              ? String(seqLeg.premium_value) 
-              : '',  // For "Based On Closest Premium"
-            lower_range: seqLeg.lower_range !== null && seqLeg.lower_range !== undefined 
-              ? String(seqLeg.lower_range) 
-              : '',  // For "Based On premium range"
-            upper_range: seqLeg.upper_range !== null && seqLeg.upper_range !== undefined 
-              ? String(seqLeg.upper_range) 
-              : '',  // For "Based On premium range"
-            atm_percent_direction: seqLeg.strike_sign || '+',
-            atm_percent_value: (() => {
-              const backendVal = seqLeg.multiplier_percentage;
-              const result = backendVal !== null && backendVal !== undefined 
-                ? String(backendVal) 
-                : '';
-              return result;
-            })(),
-          };
-          
-          extractedSequentialLegs.push(transformedSeqLeg);
-        }
-      };
-      
-      (legs || []).forEach((originalLeg, index) => {
-        if (transformedLegs[index] && !transformedLegs[index].isLazyLeg) {
-          extractSequentialLeg(transformedLegs[index], originalLeg, index);
-        }
-      });
-      
-      if (extractedSequentialLegs.length > 0) {
-        transformedLegs.push(...extractedSequentialLegs);
-      }
-      
-      
-      const unselectedLazyLegs = (unselected_legs || []).map(leg => {
-        
-        const transformed = {
-          ...leg,
-          
-          id: leg.leg_id,
-          isLazyLeg: true, // All unselected legs are lazy legs
-          customName: leg.leg_name || '',
-          is_selected: false, // All unselected legs have is_selected = false
-          
-          lots: String(leg.lot_size || 1),
-          position: leg.position_type?.toLowerCase() || 'buy',
-          option_type: leg.option_type?.toLowerCase() || 'call',
-          expiry: leg.expiry_type || '0dte',
-          
-          stop_loss_enabled: leg.is_stoploss || false,
-          stop_loss_mode: leg.stoploss_type?.toLowerCase() || 'points',
-          stop_loss_value: leg.stoploss_value || '',
-          
-          trail_enabled: leg.is_trail_sl || false,
-          trail_mode: leg.trail_sl_type?.toLowerCase() || 'points',
-          trail_value: leg.instrument_moves || '',
-          trail_lock_value: leg.stoploss_moves || '',
-          
-          target_enabled: leg.is_target || false,
-          target_mode: leg.target_type?.toLowerCase() || 'points',
-          target_value: leg.target_value || '',
-          
-          reentry_sl_enabled: leg.is_reentry_sl || false,
-          reentry_sl_mode: leg.reentry_sl_type?.toUpperCase() === 'LAZY_LEG' 
-            ? 'LAZY_LEG' 
-            : leg.reentry_sl_type?.toLowerCase() || 're_asap',
-          reentry_sl_count: leg.reentry_sl_value || '',
-          
-          reentry_tgt_enabled: leg.is_reentry_target || false,
-          reentry_tgt_mode: leg.reentry_target_type?.toUpperCase() === 'LAZY_LEG' 
-            ? 'LAZY_LEG' 
-            : leg.reentry_target_type?.toLowerCase() || 're_asap',
-          reentry_tgt_count: leg.reentry_target_value || '',
-          
-          momentum_enabled: leg.is_simple_momentum || false,
-          momentum_mode: leg.momentum_type?.toLowerCase() || 'percent_up',
-          momentum_value: leg.momentum_value || '',
-          
-          ...(!leg.is_lazy_leg && {
-            range_enabled: leg.is_range_breakout || false,
-            range_instrument: leg.range_breakout_type?.toLowerCase() || 'instrument',
-            range_time: leg.range_end_time || null,
-            range_direction: leg.range_on?.toLowerCase() || 'high',
-          }),
-          
-          strike_criteria: leg.strike_criteria || 'strike_type',
-          atm_strike: leg.atm_strike || 'ATM',
-          strike_value: leg.premium_value || '',
-          atm_percent_direction: leg.strike_sign || '+',
-          atm_percent_value: leg.multiplier_percentage || '',
-        };
-        
-        return transformed;
-      });
-      
-      
-      
-      const mainLegs = transformedLegs.filter(leg => !leg.isLazyLeg);
-      const selectedLazyLegs = transformedLegs.filter(leg => leg.isLazyLeg && leg.is_selected);
-      
-      
-      
-      
-      const allLazyLegNames = new Set();
-      const uniqueSelectedLazyLegs = [];
-      const seenSelectedNames = new Set();
-      
-      selectedLazyLegs.forEach(leg => {
-        allLazyLegNames.add(leg.customName);
-        
-        if (!seenSelectedNames.has(leg.customName)) {
-          uniqueSelectedLazyLegs.push(leg);
-          seenSelectedNames.add(leg.customName);
-        } else {
-        }
-      });
-      
-      
-      const filteredUnselectedLazyLegs = unselectedLazyLegs.filter(leg => {
-        const isDuplicate = allLazyLegNames.has(leg.customName);
-        if (isDuplicate) {
-          return false;
-        }
-        return true;
-      });
-      
-      
-      transformedLegs.push(...filteredUnselectedLazyLegs);
-      
-      
-      for (let i = 0; i < transformedLegs.length; i++) {
-        const currentLeg = transformedLegs[i];
-        
-        if (currentLeg.isLazyLeg) continue;
-        
-        const hasLazyLegInReentrySL = currentLeg.reentry_sl_type?.toUpperCase() === 'LAZY_LEG';
-        const hasLazyLegInReentryTgt = currentLeg.reentry_target_type?.toUpperCase() === 'LAZY_LEG';
-        
-        if (!hasLazyLegInReentrySL && !hasLazyLegInReentryTgt) {
-          continue;
-        }
-        
-        const lazyLegCount = hasLazyLegInReentrySL ? (currentLeg.reentry_sl_count || 0) : 0;
-        if (lazyLegCount === 0) {
-        }
-        
-        const nextLeg = transformedLegs[i + 1];
-        if (nextLeg && nextLeg.isLazyLeg && nextLeg.is_selected) {
-          
-          if (hasLazyLegInReentrySL) {
-            currentLeg.reentry_sl_mode = `lazy_leg_${nextLeg.id}`;
-          }
-          
-          if (hasLazyLegInReentryTgt) {
-            currentLeg.reentry_tgt_mode = `lazy_leg_${nextLeg.id}`;
-          }
-        } else {
-        }
-      }
-      
-      // Build lazyLegNameToId map ONCE for efficiency (avoid O(n²))
-      const lazyLegNameToId = {};
-      transformedLegs.forEach(leg => {
-        if (leg.isLazyLeg && leg.customName && !lazyLegNameToId[leg.customName]) {
-          lazyLegNameToId[leg.customName] = leg.id;
-        }
-      });
-      
-      // Process lazy leg re-entry references efficiently (reuse map)
-      transformedLegs.forEach((leg, index) => {
-        if (!leg.isLazyLeg) return;
-        
-        const slType = leg.reentry_sl_type || '';
-        const tgtType = leg.reentry_target_type || '';
-        
-        const hasNestedLazyLegInReentrySL = slType.toUpperCase() === 'LAZY_LEG';
-        const hasNestedLazyLegInReentryTgt = tgtType.toUpperCase() === 'LAZY_LEG';
-        
-        if (!hasNestedLazyLegInReentrySL && !hasNestedLazyLegInReentryTgt) {
-          return;
-        }
-        
-        
-        const hasNextLazyLeg = hasNestedLazyLegInReentrySL && (leg.reentry_sl_count > 0);
-        
-        if (hasNextLazyLeg) {
-          const nextLeg = transformedLegs[index + 1];
-          if (nextLeg && nextLeg.isLazyLeg && nextLeg.customName) {
-            const targetLegId = lazyLegNameToId[nextLeg.customName];
-            if (targetLegId) {
-              leg.reentry_sl_mode = `lazy_leg_${targetLegId}`;
-            }
-          } else {
-            
-            const backendLegIndex = legs.findIndex(l => l.leg_id === leg.leg_id);
-            
-            if (backendLegIndex !== -1 && backendLegIndex + 1 < legs.length) {
-              const backendNextLeg = legs[backendLegIndex + 1];
-              
-              if (backendNextLeg.is_lazy_leg && backendNextLeg.leg_name) {
-                const targetLegId = lazyLegNameToId[backendNextLeg.leg_name];
-                
-                if (targetLegId) {
-                  leg.reentry_sl_mode = `lazy_leg_${targetLegId}`;
-                }
-              }
-            }
-          }
-        } else if (hasNestedLazyLegInReentrySL && (leg.reentry_sl_count === 0 || leg.reentry_sl_count === '' || leg.reentry_sl_count === '0')) {
-          // Reuse existing map instead of rebuilding
-          const allLazyLegNames = Object.keys(lazyLegNameToId);
-          const otherLazyLegName = allLazyLegNames.find(name => name !== leg.customName);
-          
-          if (otherLazyLegName && lazyLegNameToId[otherLazyLegName]) {
-            leg.reentry_sl_mode = `lazy_leg_${lazyLegNameToId[otherLazyLegName]}`;
-          }
-        }
-        
-        const hasNextLazyLegTgt = hasNestedLazyLegInReentryTgt && (leg.reentry_tgt_count > 0);
-        if (hasNextLazyLegTgt) {
-          const nextLeg = transformedLegs[index + 1];
-          if (nextLeg && nextLeg.isLazyLeg) {
-            leg.reentry_tgt_mode = `lazy_leg_${nextLeg.id}`;
-          }
-        } else if (hasNestedLazyLegInReentryTgt && leg.reentry_tgt_count === 0) {
-          // Reuse existing map instead of rebuilding
-          // Reuse existing map instead of rebuilding
-          const allLazyLegNames = Object.keys(lazyLegNameToId);
-          const otherLazyLegName = allLazyLegNames.find(name => name !== leg.customName);
-          
-          if (otherLazyLegName && lazyLegNameToId[otherLazyLegName]) {
-            leg.reentry_tgt_mode = `lazy_leg_${lazyLegNameToId[otherLazyLegName]}`;
-          }
-        }
-      });
-      
-      
-      const linkedMainLegs = transformedLegs.filter(leg => !leg.isLazyLeg);
-      
-      const linkedSelectedLazyLegs = transformedLegs.filter(leg => leg.isLazyLeg && leg.is_selected);
-      
-      const seenNamesAfterLinking = new Set();
-      const deduplicatedLinkedSelectedLazyLegs = linkedSelectedLazyLegs.filter(leg => {
-        if (!seenNamesAfterLinking.has(leg.customName)) {
-          seenNamesAfterLinking.add(leg.customName);
-          return true;
-        }
-        return false;
-      });
-      
-      const linkedUnselectedLazyLegs = transformedLegs.filter(leg => leg.isLazyLeg && !leg.is_selected);
-      const filteredLinkedUnselectedLazyLegs = linkedUnselectedLazyLegs.filter(leg => {
-        return !seenNamesAfterLinking.has(leg.customName);
-      });
-      
-      const finalLegs = [
-        ...linkedMainLegs,                           // Main legs (with linked lazy leg references)
-        ...deduplicatedLinkedSelectedLazyLegs,       // Selected lazy legs (deduplicated, with nested linking)
-        ...filteredLinkedUnselectedLazyLegs          // Unselected lazy legs (filtered)
-      ];
-      
-      
-      finalLegs.forEach(leg => {
-        if (leg.isSequentialLeg) {
-        } else if (!leg.isLazyLeg) {
-          const reentryInfo = [];
-          if (leg.reentry_sl_mode) reentryInfo.push(`SL→${leg.reentry_sl_mode}`);
-          if (leg.reentry_tgt_mode) reentryInfo.push(`TGT→${leg.reentry_tgt_mode}`);
-        } else {
-          const nestedInfo = [];
-          if (leg.reentry_sl_mode) nestedInfo.push(`SL→${leg.reentry_sl_mode}`);
-          if (leg.reentry_tgt_mode) nestedInfo.push(`TGT→${leg.reentry_tgt_mode}`);
-        }
-      });
-
-      const convertBackendStrikeToUI = (backendStrike) => {
-        if (!backendStrike || backendStrike === 'ATM' || backendStrike === '0') return 'atm';
-        
-        const strike = String(backendStrike).trim();
-        
-        if (strike.toUpperCase().startsWith('ITM')) {
-          const num = strike.replace(/ITM[+-]?/i, '');
-          return `itm_${num}`;
-        }
-        
-        if (strike.toUpperCase().startsWith('OTM')) {
-          const num = strike.replace(/OTM[+-]?/i, '');
-          return `otm_${num}`;
-        }
-        
-        const numOnly = strike.replace(/[+-]/g, '');
-        if (!isNaN(numOnly) && numOnly !== '0') {
-          if (strike.includes('-')) {
-            return `itm_${numOnly}`;
-          } else if (strike.includes('+')) {
-            return `otm_${numOnly}`;
-          }
-        }
-        
-        return 'atm';
-      };
-
-      const finalLegsWithStrike = finalLegs.map(leg => {
-        const convertedStrikeType = convertBackendStrikeToUI(leg.atm_strike);
-        return {
-          ...leg,
-          strike_type: convertedStrikeType
-        };
-      });
-
-
-      const loadedConfig = {
-        symbol: strategy.symbol || 'SPXW',
-        start_date: strategy.start_date || '',
-        end_date: strategy.end_date || '',
-        start_month: strategy.start_month || '',
-        start_year: strategy.start_year || '',
-        end_month: strategy.end_month || '',
-        end_year: strategy.end_year || '',
-        dte_filter: (() => {
-          const dteValue = strategy.dte_filter;
-          const strategyType = strategy.strategy_type?.toLowerCase();
-          
-          
-          if (strategyType === 'btst' && (dteValue === 1 || dteValue === '1')) {
-            return 'combine_dte';
-          }
-          
-          if (dteValue === 0 || dteValue === '0') return '0';
-          if (dteValue === 1 || dteValue === '1') return '1';
-          if (dteValue === 'combine_dte' || dteValue === 'combined') return 'combine_dte';
-          return String(dteValue || '0'); // Default to '0' if undefined
-        })(),
-        instrument_index: strategy.instrument_index || 'SPXW',
-        underlying_from: strategy.underlying_from || 'cash',
-        underlying_type: strategy.underlying_type || 'cash',
-        square_off: strategy.is_squareoff ? 'complete' : 'partial',  // Convert bool to string
-        is_squareoff: strategy.is_squareoff || false,
-        trail_to_be: strategy.is_trail_sl_break_even || false,  // Field name conversion
-        trail_to_be_scope: strategy.trail_to_be_scope || 'all_legs',
-        is_trail_sl_break_even: strategy.is_trail_sl_break_even || false,
-        trail_sl_break_even_type: strategy.trail_sl_break_even_type?.toLowerCase() || 'na',  // Case conversion
-        strategy_type: strategy.strategy_type?.toLowerCase() || 'intraday',  // Case conversion
-        sequential_position_type: strategy.sequential_position_type || 'BUY',
-        sequential_main_leg: strategy.sequential_main_leg || 'CALL',
-        entry_time: strategy.entry_time ? strategy.entry_time.substring(0, 5) : '13:30', // Strip seconds: "HH:MM:SS" -> "HH:MM"
-        exit_time: strategy.exit_time ? strategy.exit_time.substring(0, 5) : '20:00', // Strip seconds: "HH:MM:SS" -> "HH:MM"
-        initial_capital: strategy.initial_capital || 50000,
-        lot_size: strategy.lot_size || 1,
-        capital_mode: strategy.capital_mode || 'fixed',
-        
-        is_strategy_sl: strategy.is_strategy_sl || false,
-        strategy_sl_type: strategy.strategy_sl_type?.toLowerCase() || 'points',  // Case conversion
-        strategy_sl_value: strategy.strategy_sl_value || 0,
-        is_strategy_target: strategy.is_strategy_target || false,
-        strategy_target_type: strategy.strategy_target_type?.toLowerCase() || 'points',  // Case conversion
-        strategy_target_value: strategy.strategy_target_value || 0,
-        
-        overall_stop_loss_enabled: strategy.is_strategy_sl || false,
-        overall_stop_loss_mode: strategy.strategy_sl_type?.toLowerCase() || 'mtm',  // Case conversion
-        overall_stop_loss_value: strategy.strategy_sl_value || '',
-        overall_target_enabled: strategy.is_strategy_target || false,
-        overall_target_mode: strategy.strategy_target_type?.toLowerCase() || 'mtm',  // Case conversion
-        overall_target_value: strategy.strategy_target_value || '',
-        
-        lock_profit_enabled: strategy.lock_profit_enabled || false,
-        lock_profit_mode: strategy.lock_profit_mode || 'points',
-        lock_profit_value: strategy.lock_profit_value || 0,
-        lock_profit_value1: strategy.lock_profit_value1 || '',
-        lock_profit_value2: strategy.lock_profit_value2 || '',
-        lock_profit_lock_value: strategy.lock_profit_lock_value || 1,
-        
-        is_overall_reentry_sl: strategy.is_overall_reentry_sl || false,
-        overall_reentry_sl_enabled: strategy.is_overall_reentry_sl || false,
-        overall_reentry_sl_mode: strategy.overall_reentry_sl_type?.toLowerCase() || 're_asap',  // Case conversion
-        overall_reentry_sl_type: strategy.overall_reentry_sl_type?.toLowerCase() || 're_asap',  // Case conversion
-        overall_reentry_sl_count: strategy.overall_reentry_sl_value || '',
-        overall_reentry_sl_value: strategy.overall_reentry_sl_value || 0,
-        overall_reentry_sl_cost_mode: strategy.overall_reentry_sl_cost_mode || 'same_capital',
-        overall_reentry_sl_multiplier: strategy.overall_reentry_sl_multiplier || 2,
-        overall_reentry_sl_cost_value: strategy.overall_reentry_sl_cost_value || 1.00,
-        
-        is_overall_reentry_target: strategy.is_overall_reentry_target || false,
-        overall_reentry_tgt_enabled: strategy.is_overall_reentry_target || false,
-        overall_reentry_tgt_mode: strategy.overall_reentry_target_type?.toLowerCase() || 're_asap',  // Case conversion
-        overall_reentry_target_type: strategy.overall_reentry_target_type?.toLowerCase() || 're_asap',  // Case conversion
-        overall_reentry_tgt_count: strategy.overall_reentry_target_value || '',
-        overall_reentry_target_value: strategy.overall_reentry_target_value || 0,
-        overall_reentry_tgt_cost_mode: strategy.overall_reentry_tgt_cost_mode || 'profit_percentage',
-        overall_reentry_tgt_cost_value: strategy.overall_reentry_tgt_cost_value || 1.00,
-        
-        lock_profit_enabled: strategy.is_overall_trail_sl || false,
-        lock_profit_mode: strategy.overall_trail_sl_type?.toLowerCase() || 'points',
-        lock_profit_value1: strategy.is_overall_trail_sl ? (strategy.overall_instrument_move || 0) : '',
-        lock_profit_value2: strategy.is_overall_trail_sl ? (strategy.overall_stoploss_move || 0) : '',
-        
-        ...((() => {
-          return {};
-        })()),
-        
-        legs: finalLegsWithStrike,
-        
-        strategy_name: strategyName,
-        dataLoaded: true, // Mark as data already loaded since it's a saved strategy
-      };
-
-      if (finalLegs && finalLegs.length > 0) {
-      }
-
+      beginStrategyReset();
       setStrategyConfig(loadedConfig);
-      
+
+      setStrategyImported(false);
+      setImportedConfig(null);   // see handleCreateNewStrategy
+
       setStrategyId(strategyId);
-      
+
       setStrategySavedInSession(true);
 
+      // The results on screen belong to whichever strategy was run before this
+      // one — showing them under a freshly opened strategy would attribute
+      // another strategy's trades to it.
+      setBacktestResults(null);
+
       setActiveTab('builder');
+
+      /*
+        Put the user at the top of the strategy they just opened.
+
+        Clicking a saved strategy while scrolled down -- reading legs, or a
+        previous run's results -- used to leave the page at that same offset,
+        so the new strategy appeared already scrolled past its own beginning.
+
+        It only moves when Instrument settings is NOT already on screen: if the
+        user is looking at it, their scroll position is left alone. The helper
+        waits for the section to render, because the builder remounts (its key
+        changes) and its chunk may still be loading.
+      */
+      revealSection(INSTRUMENT_SECTION_ID);
 
       setToastMessage(`Strategy "${strategyName}" loaded successfully!`);
       setToastType('success');
       setShowToast(true);
 
-      setIsLoading(false);
-
-      setTimeout(() => {
-      }, 100);
+      setIsLoadingStrategy(false);
 
     } catch (error) {
       logger.error('[App] Error loading strategy from backend:', error);
@@ -1160,13 +596,18 @@ function AppContent() {
       setToastType('error');
       setShowToast(true);
 
-      setIsLoading(false);
+      setIsLoadingStrategy(false);
     }
   };
 
+  // Kept as an every-render ref sync so the stable openStrategyInBuilder above
+  // always calls the freshest loader. Placed after the declaration it mirrors —
+  // effects run post-render, so the position changes nothing at runtime.
+  useEffect(() => { loadStrategyRef.current = handleLoadStrategyFromBackend; });
+
   const handleLoadVersion = async (strategyId, versionNumber) => {
     try {
-      setIsLoading(true);
+      setIsLoadingStrategy(true);
       
       const strategyName = contextStrategyName || strategyConfig.strategy_name;
       
@@ -1177,43 +618,43 @@ function AppContent() {
       // Use the main strategy loading function which has proper transformation logic
       await handleLoadStrategyFromBackend(strategyId, strategyName, versionNumber);
       
-      setIsLoading(false);
+      setIsLoadingStrategy(false);
     } catch (error) {
       logger.error('[App] Error loading version:', error);
-      setIsLoading(false);
-      alert(`Failed to load version: ${error.message}`);
+      setIsLoadingStrategy(false);
+      setToastMessage(`Failed to load version: ${error.message}`);
+      setToastType('error');
+      setShowToast(true);
     }
   };
 
-  // Memoized handlers to prevent StrategyBuilder re-renders
-  const handleSaveStrategyCallback = useCallback(async (configOverride = null) => {
-    // Use provided config override or fallback to strategyConfig
-    const configToSave = configOverride || strategyConfig;
-    
-    if (strategyId && strategyId !== -999 && strategyId !== '-999' && configToSave.strategy_name) {
-      return await handleSaveStrategy(configToSave.strategy_name, configToSave);
-    } else {
-      setSaveModalOpen(true);
-      return null;
-    }
-  }, [strategyId, strategyConfig]);
+  // Both refs below are refs, not state, on purpose: they are only read inside
+  // the submit handler, so setting them must not re-render the whole app shell.
+  //
+  // The builder hands us its live config when Save / Save As New is pressed.
+  // The modal only reports the typed NAME back, so the config is parked here
+  // for the moment the user confirms. Holding one existing object reference
+  // costs nothing — no copy, no serialisation.
+  const pendingSaveConfigRef = useRef(null);
+  const saveAsNewRef = useRef(false);
 
-  const handleResetStrategyId = useCallback(() => {
-    setStrategyId(null);
-    setStrategySavedInSession(false);
-  }, []);
-
-  const handleClearResults = useCallback(() => {
-    setBacktestResults(null);
-  }, []);
-
-  const handleSaveStrategy = async (strategyName, configToSave = null) => {
+  // asNew=true -> "Save As New": the payload goes out WITHOUT strategy_id, which
+  // is what tells the backend to mint a fresh strategy rather than add a version.
+  // silent: suppress the SUCCESS toast only. Used by the auto-save that runs
+  // before a backtest, where the user asked for a backtest and not for a save
+  // confirmation. Failures still toast — a save that goes wrong is never hidden.
+  const handleSaveStrategy = async (strategyName, configToSave = null, asNew = false, viaUpdateButton = false, silent = false) => {
     // Use provided config or fallback to strategyConfig
     const config = configToSave || strategyConfig;
     
     if (!config.legs || config.legs.length === 0) {
       setSaveStatus('error');
       setSaveMessage('At least one leg is required to save strategy');
+      // saveMessage alone has no on-screen home here, so this used to be a dead
+      // click with no feedback at all. Surface it like every other failure.
+      setToastMessage('At least one leg is required to save strategy');
+      setToastType('error');
+      setShowToast(true);
       return; // Don't proceed, wait for user to add legs
     }
 
@@ -1225,12 +666,11 @@ function AppContent() {
     }
 
     if (!strategyId || strategyId === -999 || strategyId === '-999') {
-      try {
-        const savedStrategies = JSON.parse(localStorage.getItem('saved_strategies_cards') || '[]');
-        const duplicateExists = savedStrategies.some(
-          strategy => strategy.name.toLowerCase() === strategyName.trim().toLowerCase()
-        );
-        
+      {
+        // From context, so a strategy saved a moment ago on another screen
+        // counts — a fresh localStorage read could still miss it.
+        const duplicateExists = hasName(strategyName);
+
         if (duplicateExists) {
           setSaveStatus('error');
           setSaveMessage('A strategy with the same name already exists for this user. Please choose a different strategy name.');
@@ -1242,10 +682,7 @@ function AppContent() {
           setTimeout(() => setSaveStatus(null), 5000);
           return; // Don't proceed with save
         }
-      } catch (error) {
-        logger.error('[App] Error checking for duplicate names:', error);
       }
-    } else {
     }
 
     setSaveStatus('loading');
@@ -1273,24 +710,38 @@ function AppContent() {
 
       // CRITICAL: Always pass strategy_id when updating an existing strategy
       // This ensures backend creates a new version instead of treating it as a new strategy
-      if (strategyId && strategyId !== -999 && strategyId !== '-999') {
+      // Drives both the request shape and the wording of the success toast:
+      // "Update" writes a new version of an existing strategy, everything else
+      // creates one.
+      const isUpdate = Boolean(!asNew && strategyId && strategyId !== -999 && strategyId !== '-999');
+
+      if (isUpdate) {
         requestBody.strategy.strategy_id = strategyId;
         console.log('[App] Updating existing strategy with ID:', strategyId);
       } else {
-        console.log('[App] Creating new strategy');
+        // Save As New (or a first-time save): id stays null in the request.
+        requestBody.strategy.strategy_id = null;
+        console.log('[App] Creating new strategy', asNew ? '(Save As New)' : '');
       }
 
       logger.request('/save-strategy', requestBody);
-      requestBody.legs?.forEach((leg, idx) => {
-      });
 
-      const result = await saveStrategy(requestBody);
+      // The ENDPOINT is chosen by intent, not by whether the strategy exists:
+      // only the Update button PUTs to /api/update-strategy. isUpdate still
+      // governs the payload (strategy_id included) for every path.
+      const result = await (viaUpdateButton ? updateStrategy : saveStrategy)(requestBody);
 
-      const timestamp = new Date().toLocaleTimeString();
-      
-      window.requestAnimationFrame(() => {
-      });
-      
+      // The backend reports failure as HTTP 200 with { status: false, message }.
+      // Without this check a rejected save toasted "saved successfully!" and
+      // stored a null strategy_id in context — the run-backtest that followed
+      // then went out with strategy_name: null.
+      // The raw body sits on result.data — the service wraps it in
+      // { success, data, strategy_id, ... }, so result.status is always
+      // undefined and this check silently passed for every failure.
+      if (result?.data?.status === false || result?.status === false) {
+        throw new Error(result?.data?.message || result?.message || 'Save failed');
+      }
+
       window.__saveCount = (window.__saveCount || 0) + 1;
       
       const savedStrategyId = result.strategy_id;
@@ -1301,48 +752,42 @@ function AppContent() {
       });
 
       updateStrategyData(savedStrategyId, savedStrategyName, savedVersion);
-      
-      setTimeout(() => {
-        const storedData = JSON.parse(localStorage.getItem('strategy_session_data') || '{}');
-      }, 500);
-      
-      window.requestAnimationFrame(() => {
-      });
 
-      try {
-        const savedCards = JSON.parse(localStorage.getItem('saved_strategies_cards') || '[]');
-        
-        const existingIndex = savedCards.findIndex(card => card.name === savedStrategyName);
-        
-        const newCard = {
-          id: savedStrategyId,
-          name: savedStrategyName,
-          version: result.version || contextVersion || 1,
-          symbol: config.symbol || 'SPXW',
-          strategy_type: config.strategy_type || 'intraday',
-          entry_time: config.entry_time || '13:30',
-          exit_time: config.exit_time || '20:00',
-          start_date: config.start_date || null,
-          end_date: config.end_date || null,
-          created_at: existingIndex !== -1 ? savedCards[existingIndex].created_at : new Date().toISOString(), // Keep original created_at
-          leg_count: config.legs?.length || 0,
-        };
-        
-        if (existingIndex !== -1) {
-          savedCards[existingIndex] = newCard;
-        } else {
-          savedCards.push(newCard);
-        }
-        
-        localStorage.setItem('saved_strategies_cards', JSON.stringify(savedCards));
-      } catch (error) {
-        logger.error('[App] ⚠️ Failed to save strategy card to localStorage:', error);
+      // Adopt the id the backend just minted. Without this the app keeps
+      // pointing at the ORIGINAL strategy, so the next plain Save would write
+      // a new version of the old one instead of the copy just created.
+      if (asNew && savedStrategyId) {
+        setStrategyId(savedStrategyId);
+        setStrategySavedInSession(true);
       }
 
+
+      // The saved list lives in context, which mirrors it to localStorage — one
+      // owner, so a save is visible everywhere at once. The version comes from
+      // the response: it is what a later get-strategy has to ask for.
+      upsertStrategy({
+        id: savedStrategyId,
+        name: savedStrategyName,
+        version: result.version || contextVersion || 1,
+        // The Index dropdown writes to config.dte_filter (it holds the index
+        // name, not a DTE, despite the key). config.symbol is a stale default
+        // no UI updates, which is why cards used to read SPXW. Both payload
+        // builders already send config.dte_filter as `symbol`.
+        symbol: config.dte_filter || config.symbol || 'sensex',
+        strategy_type: config.strategy_type || 'intraday',
+        entry_time: config.entry_time || '09:16',
+        exit_time: config.exit_time || '15:40',
+        start_date: config.start_date || null,
+        end_date: config.end_date || null,
+        created_at: new Date().toISOString(),
+        leg_count: config.legs?.length || 0,
+      });
+
+      // Message follows the endpoint that actually ran.
+      const successMessage = viaUpdateButton ? 'Strategy updated successfully' : 'Strategy saved';
+
       setSaveStatus('success');
-      setSaveMessage('Strategy saved successfully!');
-      setCurrentStrategyId(result.strategy_id);
-      
+      setSaveMessage(successMessage);
       setStrategyId(result.strategy_id);
       
 
@@ -1352,9 +797,11 @@ function AppContent() {
         strategy_name: strategyName
       }));
 
-      setToastMessage('Strategy saved successfully!');
-      setToastType('success');
-      setShowToast(true);
+      if (!silent) {
+        setToastMessage(successMessage);
+        setToastType('success');
+        setShowToast(true);
+      }
 
 
       setStrategiesRefreshKey(prev => prev + 1);
@@ -1374,6 +821,11 @@ function AppContent() {
 
       setSaveStatus('error');
       setSaveMessage(error.message || 'Failed to save strategy. Please try again.');
+      // saveMessage has no on-screen home of its own — the toast is what the
+      // user actually sees.
+      setToastMessage(error.message || 'Failed to save strategy. Please try again.');
+      setToastType('error');
+      setShowToast(true);
 
       setTimeout(() => setSaveStatus(null), 5000);
 
@@ -1381,61 +833,197 @@ function AppContent() {
     }
   };
 
+  // Memoized handlers to prevent StrategyBuilder re-renders
+  const handleSaveStrategyCallback = useCallback(async (configOverride = null, opts = {}) => {
+    // Prefer the builder's live config; strategyConfig is a debounced copy that
+    // can lag behind the screen (notably right after a strategy loads).
+    const configToSave = configOverride || strategyConfig;
+
+    if (strategyId && strategyId !== -999 && strategyId !== '-999' && configToSave.strategy_name) {
+      // opts.viaUpdateButton is set ONLY by the Update button. The auto-save
+      // that runs before a backtest goes through this same callback and must
+      // stay on POST /api/save-strategy.
+      return await handleSaveStrategy(configToSave.strategy_name, configToSave, false, opts.viaUpdateButton === true, opts.silent === true);
+    } else {
+      pendingSaveConfigRef.current = configOverride;
+      setSaveModalOpen(true);
+      return null;
+    }
+  }, [strategyId, strategyConfig]);
+
+  // "Save As New": reuse the existing name modal, but tell the save to omit
+  // strategy_id so the backend mints a fresh strategy instead of a new version.
+  const handleSaveAsNew = useCallback((configOverride = null) => {
+    saveAsNewRef.current = true;
+    pendingSaveConfigRef.current = configOverride;
+    setSaveModalOpen(true);
+  }, []);
+
+  // The modal reports the typed name; the refs supply which save it is and the
+  // config that was on screen when the button was pressed.
+  const handleModalSave = useCallback(async (strategyName) => {
+    const asNew = saveAsNewRef.current;
+    const configToSave = pendingSaveConfigRef.current;
+    saveAsNewRef.current = false;
+    pendingSaveConfigRef.current = null;
+    return await handleSaveStrategy(strategyName, configToSave, asNew);
+  }, [strategyConfig, strategyId]);
+
+  const handleClearResults = useCallback(() => {
+    setBacktestResults(null);
+  }, []);
+
+  // "Create New Strategy": drop the current strategy's identity and config and
+  // land on an empty builder, whose header then reads "Unsaved Strategy".
+  // versionLoadCounter is bumped because it keys StrategyBuilder — without it
+  // the old form state would survive the remount.
+  const handleCreateNewStrategy = useCallback(() => {
+    // Starting a fresh strategy also ends any Algo Trade portfolio round trip.
+    resetAlgoTab();
+    beginStrategyReset();
+    clearStrategyData();
+    setStrategyImported(false);   // a blank strategy can be imported into again
+    // The import hands its config to the builder through this override, which
+    // WINS over strategyConfig (see the savedConfig prop). Leaving it set meant
+    // "New Strategy" emptied strategyConfig and then remounted the builder onto
+    // the imported strategy again — a blank form that was not blank.
+    setImportedConfig(null);
+    setStrategyId(null);
+    setStrategySavedInSession(false);
+    setStrategyConfig({});
+    setBacktestResults(null);
+    setVersionLoadCounter((prev) => prev + 1);
+    setActiveTab("builder");
+  }, [clearStrategyData, beginStrategyReset]);
+
+  /**
+   * "Create Strategies" from the top bar: a blank builder, and a refreshed
+   * library behind it.
+   *
+   * The refresh is why this is not just `handleCreateNewStrategy` -- the
+   * sidebar tree is what you reach for straight after creating, and it should
+   * show what the BACKEND has rather than whatever this browser cached.
+   * Fired and forgotten: the tree listens for the result, and a failed list
+   * must never block opening the builder.
+   */
+  const startNewStrategy = useCallback(() => {
+    handleCreateNewStrategy();
+    setActiveTab('builder');
+    refreshLibrary();
+  }, [handleCreateNewStrategy]);
+
+  /**
+   * A .algtst import lands here: same reset as "New Strategy", but seeded with
+   * the file's config instead of an empty one. No id, no name, nothing saved —
+   * the header therefore reads "Unsaved Strategy" and the user is looking at a
+   * draft they can edit before committing it. The save is what creates the
+   * record, exactly as it would for a strategy typed in by hand.
+   */
+  const handleImportStrategy = useCallback((imported) => {
+    beginStrategyReset();
+    clearStrategyData();
+    setStrategyId(null);
+    setStrategySavedInSession(false);
+    setBacktestResults(null);
+
+    // Handed to StrategyBuilder directly rather than through strategyConfig.
+    // Routing it through strategyConfig does not survive: the builder flushes
+    // its pending config up here when it unmounts, and pushes its own again
+    // ~200ms after mounting, so the import was overwritten by whatever empty
+    // config was on screen a moment earlier — an import that looked like it
+    // worked and left an empty Leg Builder. While this override is set it is
+    // what the builder reads; handleConfigChange drops it as soon as the
+    // builder pushes the imported strategy back, at which point strategyConfig
+    // holds it too.
+    setImportedConfig(imported);
+    setStrategyImported(true);
+
+    // Remounts StrategyBuilder (it is keyed on this) so the imported config is
+    // what the form initialises from rather than being merged into a live one.
+    setVersionLoadCounter((prev) => prev + 1);
+    setActiveTab('builder');
+
+    setToastMessage('Strategy imported successfully');
+    setToastType('success');
+    setShowToast(true);
+  }, [clearStrategyData]);
+
   return (
-    <div className="flex h-screen bg-gray-50">
-      <BackgroundLoadingScreen isVisible={backtestLoading} duration={60} />
-        
+    <div className="flex flex-col h-screen" style={{ backgroundColor: colors.page.background }}>
         {/* Toast Notification */}
         {showToast && (
           <Toast
             message={toastMessage}
             type={toastType}
             onClose={() => setShowToast(false)}
-            duration={3000}
           />
         )}
-        
-        {showAutoTradingMonitor ? (
-          <AutoTradingMonitor onBack={() => setShowAutoTradingMonitor(false)} />
-        ) : (
-          <>
-          {mainSidebarOpen && (
-            <Sidebar 
-              activeTab={activeTab} 
-              setActiveTab={(tab) => {
-                setActiveTab(tab);
-              }} 
-              onToggleSidebar={() => setMainSidebarOpen(false)} 
+
+        {/* The one static bar, above the sidebar and every page alike:
+            Broker Setup, then the account button. */}
+        <TopBar onBrokerSetup={openBrokerSetup}
+                onLogout={onLogout}
+                onNavigate={navigateFromTopBar}
+                onCreateStrategy={startNewStrategy} />
+
+        <div className="app-shell relative flex flex-1 min-h-0">
+          {mainSidebarOpen ? (
+            /* Open on every page until the user closes it themselves — the
+               only exception is the Pro view, which hides it on entry (it has
+               a rail of its own) and hands it back on exit. */
+            <Sidebar
+              className="app-sidebar"
+              onOpenStrategy={openStrategyInBuilder}
+              onNotify={notify}
+              onCreateNewStrategy={handleCreateNewStrategy}
+              onToggleSidebar={() => setMainSidebarOpen(false)}
             />
+          ) : (
+            /* Collapsed rail, identical on every tab: the thin white strip
+               with its vertical rule and the » circle — white with a quiet
+               ring at rest, theme blue on hover, exactly like its « twin. */
+            <div className="w-[30px] shrink-0 bg-white border-r relative" style={{ borderColor: '#ececec' }}>
+              <button
+                onClick={() => setMainSidebarOpen(true)}
+                className="absolute -right-3 top-9 w-7 h-7 rounded-full flex items-center justify-center z-20 text-gray-700 border transition-colors"
+        style={{ backgroundColor: '#F5F5F5', borderColor: '#E7E7E7' }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.backgroundColor = '#0B619B';
+                  e.currentTarget.style.color = '#FFFFFF';
+                  e.currentTarget.style.borderColor = '#0B619B';
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.backgroundColor = '#F5F5F5';
+                  e.currentTarget.style.color = '';
+                  e.currentTarget.style.borderColor = '#E7E7E7';
+                }}
+                title="Show the menu"
+              >
+                <ChevronsRight size={14} />
+              </button>
+            </div>
           )}
 
           <div className="flex-1 flex flex-col overflow-hidden">
-            <Header />
+            {/* Strategy bar only on the builder (main) page */}
+            {activeTab === 'builder' && <Header config={strategyConfig} liveConfigRef={liveConfigRef} strategyId={strategyId} onCreateNewStrategy={handleCreateNewStrategy} onImportStrategy={handleImportStrategy} canImport={!strategyImported && !strategyId} hasResults={Boolean(backtestResults)} onNotify={(message, type = 'success') => { setToastMessage(message); setToastType(type); setShowToast(true); }} />}
 
-            {!mainSidebarOpen && (
-              <button
-                onClick={() => setMainSidebarOpen(true)}
-                className="fixed left-0 top-20 bg-blue-600 text-white rounded-full p-3 m-2 shadow-lg hover:bg-blue-700 transition-colors z-40"
-                title="Show Sidebar"
-              >
-                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-                </svg>
-              </button>
-            )}
-
-            <main className="flex-1 overflow-y-auto px-4 sm:px-6 lg:px-8 xl:px-12 py-6">
+            <main className="flex-1 overflow-y-auto px-4 sm:px-5 py-6">
               {activeTab === "builder" && (
-                <Suspense fallback={<BackgroundLoadingScreen />}>
+                <LazyTab fallback={<TabFallback />}>
                   <StrategyBuilder
-                    key={`${strategyId || 'default'}-${versionLoadCounter}`} // Force re-render when strategy or version changes
+                    key={`${strategyId || 'default'}-${versionLoadCounter}-${builderGeneration}`} // Force re-render when strategy or version changes
+                    sidebarOpen={mainSidebarOpen}
                     onRunBacktest={handleRunBacktest}
                     isLoading={isLoading}
-                    savedConfig={strategyConfig}
+                    isLoadingStrategy={isLoadingStrategy}
+                    liveConfigRef={liveConfigRef}
+                    generation={builderGeneration}
+                    savedConfig={importedConfig ?? strategyConfig}
                     onConfigChange={handleConfigChange}
                     onSaveStrategy={handleSaveStrategyCallback}
+                    onSaveAsNew={handleSaveAsNew}
                     strategyId={strategyId}
-                    onResetStrategyId={handleResetStrategyId}
                     backtestResults={backtestResults}
                     onClearResults={handleClearResults}
                     strategySavedInSession={strategySavedInSession}
@@ -1443,43 +1031,46 @@ function AppContent() {
                     backtestCompletedCounter={backtestCompletedCounter}
                     onLoadVersion={handleLoadVersion}
                   />
-                </Suspense>
+                </LazyTab>
               )}
 
               {activeTab === "reports" && (
-                <Suspense fallback={<BackgroundLoadingScreen />}>
+                <LazyTab fallback={<TabFallback />}>
                   <Reports
                     onLoadConfig={handleLoadConfigFromReport}
                     onSwitchToBuilder={() => setActiveTab("builder")}
                   />
-                </Suspense>
-              )}
-
-              {activeTab === "live-dashboard" && (
-                <Suspense fallback={<BackgroundLoadingScreen />}>
-                  <LiveTradingDashboard
-                    strategyConfig={strategyConfig}
-                    onShowMonitor={() => setShowAutoTradingMonitor(true)}
-                  />
-                </Suspense>
+                </LazyTab>
               )}
 
               {activeTab === "portfolios" && (
-                <Suspense fallback={<BackgroundLoadingScreen />}>
+                <LazyTab fallback={<TabFallback />}>
                   <Portfolios 
+                    onCreateNewStrategy={handleCreateNewStrategy}
+                    // Same loader the Strategies list uses: it calls
+                    // get-strategy, rebuilds the config and switches to the
+                    // builder tab, so the portfolio row needs nothing of its own.
+                    openPortfolioName={openPortfolioName}
+                    onOpenedPortfolio={clearOpenPortfolio}
+                    onOpenStrategyInBuilder={handleLoadStrategyFromBackend}
                     onShowToast={(message, type = 'success') => {
                       setToastMessage(message);
                       setToastType(type);
                       setShowToast(true);
                     }}
                   />
-                </Suspense>
+                </LazyTab>
               )}
 
-              {activeTab === "live-settings" && (
-                <Suspense fallback={<BackgroundLoadingScreen />}>
-                  <LiveTradingSettings />
-                </Suspense>
+              {activeTab === "algo-trade" && (
+                <LazyTab fallback={<TabFallback />}>
+                  <AlgoTrade
+                    key={`algo-${algoEntry.seq}`}
+                    initialView={algoEntry.view}
+                    onNotify={notify}
+                    onEditPortfolio={goToPortfolios}
+                  />
+                </LazyTab>
               )}
 
               {activeTab === "settings" && (
@@ -1492,7 +1083,7 @@ function AppContent() {
               )}
 
               {activeTab === "save-strategy" && (
-                <Suspense fallback={<BackgroundLoadingScreen />}>
+                <LazyTab fallback={<TabFallback />}>
                   <SavedStrategiesList 
                     key={strategiesRefreshKey}
                     refreshKey={strategiesRefreshKey}
@@ -1505,20 +1096,27 @@ function AppContent() {
                     }}
                     onRefreshStrategies={() => setStrategiesRefreshKey(prev => prev + 1)}
                   />
-                </Suspense>
+                </LazyTab>
               )}
             </main>
           </div>
+        </div>
 
           <SaveStrategyModal
             isOpen={saveModalOpen}
-            onClose={() => setSaveModalOpen(false)}
-            onSave={handleSaveStrategy}
+            // Cancelling must clear both refs: the flag, or the next plain Save
+            // would silently create a second strategy instead of updating this
+            // one; and the parked config, so it cannot leak into a later save
+            // (it would also pin that object in memory until then).
+            onClose={() => {
+              saveAsNewRef.current = false;
+              pendingSaveConfigRef.current = null;
+              setSaveModalOpen(false);
+            }}
+            onSave={handleModalSave}
             saveStatus={saveStatus}
             saveMessage={saveMessage}
           />
-        </>
-      )}
     </div>
   );
 }

@@ -1,4 +1,6 @@
 import { useState, useRef, useEffect, forwardRef } from 'react';
+import { Calendar as CalendarIcon } from 'lucide-react';
+import { colors } from '../theme/colors';
 
 // Segmented DD/MM/YYYY date input with SINGLE CLICK selection
 // Click any segment (DD, MM, YYYY) to select and highlight it
@@ -16,7 +18,10 @@ const parseValue = (v) => {
   return { day: 'DD', month: 'MM', year: 'YYYY' };
 };
 
-const DateSegmentInput = forwardRef(({ value, onCommit, onKeyDown, disabled = false, placeholder = 'Date' }, ref) => {
+const DateSegmentInput = forwardRef(({ value, onCommit, onKeyDown, disabled = false, placeholder = 'Date', fullWidth = false,
+  /** Shorter and tighter. Opt-in, so the Portfolio screen's fields keep the
+   *  size they were designed at. */
+  compact = false }, ref) => {
   const initial = parseValue(value);
   const [day, setDay] = useState(initial.day);
   const [month, setMonth] = useState(initial.month);
@@ -26,6 +31,7 @@ const DateSegmentInput = forwardRef(({ value, onCommit, onKeyDown, disabled = fa
   const lastCommittedValueRef = useRef(value);
   const isTypingRef = useRef(false);
   const containerRef = useRef(null);
+  const nativeDateRef = useRef(null);
 
   // Merge internal ref with forwarded ref
   useEffect(() => {
@@ -117,13 +123,24 @@ const DateSegmentInput = forwardRef(({ value, onCommit, onKeyDown, disabled = fa
       else if (activeSegment === 'month') selectSegment('year');
       return;
     }
+    // Tab walks DD -> MM -> YYYY, and Shift+Tab walks back. At either end the
+    // event is NOT consumed, so focus leaves for the next/previous field like
+    // any normal control. Previously both branches called preventDefault()
+    // unconditionally, which trapped focus: Tab could never exit from YYYY and
+    // Shift+Tab could never exit from DD.
     if (e.key === 'Tab' && !e.shiftKey) {
+      // No active segment means nothing is being edited (handleBlur nulls it),
+      // so the key must pass through rather than be consumed for no movement.
+      if (!activeSegment || activeSegment === 'year') return;   // last segment -> let Tab out
       e.preventDefault();
       if (activeSegment === 'day') selectSegment('month');
       else if (activeSegment === 'month') selectSegment('year');
       return;
     }
     if (e.key === 'Tab' && e.shiftKey) {
+      // null means focus only just arrived (onFocus sets 'day' on the next
+      // render) — treat it as the first segment so the key is never swallowed.
+      if (!activeSegment || activeSegment === 'day') return;
       e.preventDefault();
       if (activeSegment === 'month') selectSegment('day');
       else if (activeSegment === 'year') selectSegment('month');
@@ -217,6 +234,54 @@ const DateSegmentInput = forwardRef(({ value, onCommit, onKeyDown, disabled = fa
     }
   };
 
+  /*
+    PUT THE PICKER WHERE IT FITS, before opening it.
+
+    Chrome aligns the native panel's left edge with its input and does NOT
+    flip horizontally when it overflows -- so End Date, which sits at the
+    right edge on both the builder and the portfolio page, opened a panel that
+    ran off the window and was cut in half. Spanning the field was not enough:
+    the field itself is what is too far right.
+
+    So the hidden input is moved to fixed viewport coordinates chosen so the
+    panel fits, then the picker is opened against it. Clamped on both axes:
+    pushed left when the right edge would overflow, and raised above the field
+    when there is not enough room below.
+
+    THE SIZES ARE MEASURED, not guessed, and the height has to be close.
+    Chrome draws the panel DOWNWARDS from the anchor, so when the anchor is
+    raised to clear the bottom of the window, an over-estimated height lifts
+    it too far and leaves a visible gap between panel and field -- 73px of it,
+    at the first estimate of 340. The panel is ~218 x 275 at a six-row month;
+    285 keeps a small margin for the rows a long month adds.
+
+    Width is deliberately the looser of the two: over-estimating it only
+    shifts the panel further from the right edge, which is harmless.
+  */
+  const placeAnchor = () => {
+    const el = nativeDateRef.current;
+    const field = containerRef.current;
+    if (!el || !field) return;
+
+    const PANEL_W = 240;
+    const PANEL_H = 285;
+    const GAP = 8;
+
+    const r = field.getBoundingClientRect();
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+
+    const left = Math.max(GAP, Math.min(r.left, vw - PANEL_W - GAP));
+    const below = r.bottom + PANEL_H + GAP <= vh;
+    const top = below ? r.bottom : Math.max(GAP, r.top - PANEL_H - GAP);
+
+    el.style.position = 'fixed';
+    el.style.left = `${left}px`;
+    el.style.top = `${top}px`;
+    el.style.width = '1px';
+    el.style.height = '1px';
+  };
+
   return (
     <div
       ref={containerRef}
@@ -227,41 +292,90 @@ const DateSegmentInput = forwardRef(({ value, onCommit, onKeyDown, disabled = fa
       onFocus={() => { if (!activeSegment) selectSegment('day'); }}
       onBlur={handleBlur}
       className={[
-        'inline-flex items-center px-4 py-2.5 text-base border rounded-2xl font-medium bg-white transition-all duration-200 select-none min-w-[140px] justify-center',
+        'relative flex items-center border rounded-md font-normal bg-white transition-all duration-200 select-none justify-center',
+        compact ? 'px-2 h-8 text-[12px]' : 'px-3 h-10 text-[13px]',
+        fullWidth ? 'w-full' : 'w-fit',
         disabled ? 'opacity-50 cursor-not-allowed' : 'cursor-text hover:border-gray-400 hover:shadow-md',
-        activeSegment ? 'ring-2 border-transparent' : 'border-gray-300',
+        activeSegment ? 'ring-2 border-transparent' : 'border-[#e3e3e3]',
       ].join(' ')}
-      style={activeSegment ? { '--tw-ring-color': '#60a5fa' } : {}}
+      style={activeSegment ? { '--tw-ring-color': colors.primary.hover } : {}}
     >
       {/* DD segment - SINGLE CLICK to select */}
       <span
         onClick={() => { selectSegment('day'); containerRef.current?.focus(); }}
         aria-label={`${placeholder} day`}
-        className={`px-0.5 rounded min-w-[24px] text-center cursor-pointer ${activeSegment === 'day' ? 'text-white' : day === 'DD' ? 'text-gray-400' : ''}`}
-        style={activeSegment === 'day' ? { backgroundColor: '#60a5fa' } : {}}
+        className={`px-0.5 rounded min-w-[18px] text-center cursor-pointer ${activeSegment === 'day' ? 'text-white' : day === 'DD' ? 'text-gray-400' : ''}`}
+        style={activeSegment === 'day' ? { backgroundColor: colors.primary.hover } : {}}
       >
         {day}
       </span>
-      <span className="text-gray-400">/</span>
+      <span className="text-gray-400 -mx-0.5">/</span>
       {/* MM segment - SINGLE CLICK to select */}
       <span
         onClick={() => { selectSegment('month'); containerRef.current?.focus(); }}
         aria-label={`${placeholder} month`}
-        className={`px-0.5 rounded min-w-[24px] text-center cursor-pointer ${activeSegment === 'month' ? 'text-white' : month === 'MM' ? 'text-gray-400' : ''}`}
-        style={activeSegment === 'month' ? { backgroundColor: '#60a5fa' } : {}}
+        className={`px-0.5 rounded min-w-[18px] text-center cursor-pointer ${activeSegment === 'month' ? 'text-white' : month === 'MM' ? 'text-gray-400' : ''}`}
+        style={activeSegment === 'month' ? { backgroundColor: colors.primary.hover } : {}}
       >
         {month}
       </span>
-      <span className="text-gray-400">/</span>
+      <span className="text-gray-400 -mx-0.5">/</span>
       {/* YYYY segment - SINGLE CLICK to select */}
       <span
         onClick={() => { selectSegment('year'); containerRef.current?.focus(); }}
         aria-label={`${placeholder} year`}
-        className={`px-0.5 rounded min-w-[40px] text-center cursor-pointer ${activeSegment === 'year' ? 'text-white' : year === 'YYYY' ? 'text-gray-400' : ''}`}
-        style={activeSegment === 'year' ? { backgroundColor: '#60a5fa' } : {}}
+        className={`px-0.5 rounded min-w-[32px] text-center cursor-pointer ${activeSegment === 'year' ? 'text-white' : year === 'YYYY' ? 'text-gray-400' : ''}`}
+        style={activeSegment === 'year' ? { backgroundColor: colors.primary.hover } : {}}
       >
         {year}
       </span>
+      {/* Calendar icon — opens the browser's native date picker. */}
+      <button
+        type="button"
+        onMouseDown={(e) => {
+          e.preventDefault();
+          if (disabled) return;
+          const el = nativeDateRef.current;
+          if (!el) return;
+          placeAnchor();
+          try { el.showPicker(); } catch { el.click(); }
+        }}
+        disabled={disabled}
+        aria-label={`Open ${placeholder} calendar`}
+        className="ml-2 text-gray-900 hover:text-black disabled:cursor-not-allowed"
+      >
+        <CalendarIcon size={13} />
+      </button>
+      {/*
+        THE ANCHOR THE NATIVE CALENDAR OPENS AGAINST.
+
+        placeAnchor() above moves it to viewport coordinates that leave room
+        for the panel, just before the picker opens. Invisible and untouchable
+        throughout: opacity-0, pointer-events-none, tabIndex -1, aria-hidden.
+      */}
+      <input
+        ref={nativeDateRef}
+        type="date"
+        tabIndex={-1}
+        aria-hidden="true"
+        className="fixed w-px h-px opacity-0 pointer-events-none"
+        value={/^\d{4}-\d{2}-\d{2}$/.test(value || '') ? value : ''}
+        onChange={(e) => {
+          const v = e.target.value;
+          if (!v) return;
+          const [y, m, d] = v.split('-');
+          setDay(d);
+          setMonth(m);
+          setYear(y);
+          const accepted = onCommit ? onCommit(v) : true;
+          if (accepted === false) {
+            const parsed = parseValue(value);
+            setDay(parsed.day);
+            setMonth(parsed.month);
+            setYear(parsed.year);
+          }
+        }}
+      />
     </div>
   );
 });

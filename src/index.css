@@ -1,10 +1,32 @@
 @import "tailwindcss";
 
+/* Cross-platform normalization.
+   text-size-adjust stops mobile WebKit/Blink inflating text on its own;
+   tap-highlight removes Android Chrome's grey flash on buttons. Both are
+   no-ops on desktop, so nothing changes there. */
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  -webkit-tap-highlight-color: transparent;
+}
+
 body {
   margin: 0;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  /* Inter first — bundled locally (see main.jsx), so every OS renders the
+     same face instead of Segoe UI on Windows vs Roboto/DejaVu on Linux.
+     The old system stack stays behind it purely as a fallback. */
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+/* Toast: slides down from above the viewport and settles, AlgoTest-style. */
+@keyframes toast-slide-down {
+  from { transform: translateY(-120%); opacity: 0; }
+  to   { transform: translateY(0);     opacity: 1; }
+}
+.animate-toast-in {
+  animation: toast-slide-down 0.28s cubic-bezier(0.21, 1.02, 0.73, 1) both;
 }
 
 /* Toast animation */
@@ -21,4 +43,924 @@ body {
 
 .animate-slide-in-right {
   animation: slide-in-right 0.3s ease-out;
+}
+
+/* ── Native form controls: one look on every OS ──────────────────────────────
+   These three widgets are drawn by the OS, so they are the last things that
+   still differed between the lab PCs. All three are pure appearance — typing,
+   arrow keys, wheel and click behaviour are untouched. */
+
+/* 3. Number spinners. Chromium draws stepper arrows, Firefox draws a different
+      pair, and both only on hover/focus — so the same field had three looks.
+      Hidden everywhere; the value still steps with the arrow keys. */
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type="number"] {
+  -moz-appearance: textfield;   /* Firefox */
+  appearance: textfield;
+}
+
+/* ...except Total Lot, which opts back in to the native stepper. Chromium only
+   paints those arrows on hover/focus, which is the behaviour wanted here. The
+   field's own min="1" is what keeps the stepper from going below 1; it still
+   accepts any positive number typed directly. */
+input[type="number"].lot-spinner::-webkit-outer-spin-button,
+input[type="number"].lot-spinner::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  appearance: none;
+  margin: 0;
+}
+
+/* ...and back on only while the pointer is over the field. Chromium's own rule
+   reveals the stepper on focus as well, which left it showing after a click;
+   hanging it off :hover alone keeps the field clean until it is pointed at. */
+input[type="number"].lot-spinner:hover::-webkit-outer-spin-button,
+input[type="number"].lot-spinner:hover::-webkit-inner-spin-button {
+  -webkit-appearance: auto;
+  appearance: auto;
+  margin: 0;
+  opacity: 1;
+}
+
+input[type="number"].lot-spinner {
+  -moz-appearance: number-input;
+  appearance: auto;
+  /* The stepper is drawn at the right edge of the CONTENT box, so the field's
+     px-3.5 was holding it 14px in from the border and it read as sitting in
+     the middle of the field. Trimming the right padding puts it against the
+     edge; the left padding is untouched, so the value does not move. */
+  padding-right: 2px;
+}
+
+/* 4. Scrollbars. Windows draws a wide grey bar, macOS an overlay, Linux/GTK
+      something else again. scrollbar-color IS inherited so <html> is enough for
+      it, but scrollbar-width is NOT — set on <html> alone, inner overflow
+      containers stayed on the OS default. Hence the universal selector for that
+      one declaration; the -webkit-* rules cover Chromium/Safari the same way. */
+html {
+  scrollbar-color: #c9c9c9 transparent;
+}
+* {
+  scrollbar-width: thin;
+}
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background-color: #c9c9c9;
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover { background-color: #a8a8a8; }
+::-webkit-scrollbar-corner { background: transparent; }
+
+/* 5. Checkboxes / radios. Nine already set accentColor inline; this gives the
+      remaining ones the same blue instead of the OS default (blue on Windows,
+      grey-blue on Linux). Inline styles still win, so the explicit ones keep
+      whatever they set. accent-color needs Chrome 93 / FF 92 / Safari 15.4 —
+      all below our support floor, so every supported browser gets it. */
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: #0782DA;
+}
+
+/* 6. Pointer cursor on interactive controls. Browsers default <button> and
+      <select> to the arrow cursor — 32 of 34 buttons and 7 of 10 selects were
+      rendering `default`, while AlgoTest shows the hand on all of them.
+      Element selectors only (specificity 0,0,1), so every existing cursor-*
+      utility still wins: cursor-grab on the drag handle, cursor-text on the
+      segment inputs, and the five deliberate cursor-default. */
+button,
+select,
+summary,
+[role="button"],
+input[type="checkbox"],
+input[type="radio"],
+label[for] {
+  cursor: pointer;
+}
+button:disabled,
+select:disabled,
+input:disabled {
+  cursor: not-allowed;
+}
+
+/* Hidden scrollbars for the time-picker columns (AlgoTest look).
+   Class selectors outrank the element/global rules above, so these stay
+   scrollbar-free. */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+/* ── Legacy-browser colour fallback ──────────────────────────────────────────
+   Tailwind 4 emits its palette in OKLCH (--color-red-600: oklch(...)) with no
+   fallback. Chrome <111 / Firefox <113 cannot parse oklch(), so the substituted
+   value is invalid at computed-value time and the property resolves to its
+   initial value — backgrounds go transparent, text colours fall back to black.
+   On the lab PCs (Windows 7 caps Chrome at 109) that made white-on-coloured
+   toasts and buttons invisible, and the green/red P&L figures render black.
+
+   Gated on @supports so ONLY those browsers take this path: a browser that
+   understands oklch() keeps Tailwind's original values untouched, including the
+   extra saturation the 17 out-of-gamut colours get on a wide-gamut display. A
+   browser that does not understand it fails the condition, `not` flips that to
+   true, and it gets these hex equivalents instead — converted from Tailwind's
+   own OKLCH through OKLab→linear-sRGB, and measured to paint within 1/255 of
+   what Chrome renders from the oklch itself.
+
+   Unlayered, so it outranks Tailwind's @layer theme. Opacity modifiers
+   (bg-black/50 etc.) already ship their own @supports fallback and are left
+   alone. */
+@supports not (color: oklch(0% 0 0)) {
+  :root {
+      --color-blue-100: #dbeafe;
+      --color-blue-200: #bedbff;
+      --color-blue-300: #8ec5ff;
+      --color-blue-400: #51a2ff;
+      --color-blue-50: #eff6ff;
+      --color-blue-500: #2b7fff;
+      --color-blue-600: #155dfc;
+      --color-blue-700: #1447e6;
+      --color-blue-800: #193cb8;
+      --color-blue-900: #1c398e;
+      --color-cyan-500: #00b8db;
+      --color-gray-100: #f3f4f6;
+      --color-gray-200: #e5e7eb;
+      --color-gray-300: #d1d5dc;
+      --color-gray-400: #99a1af;
+      --color-gray-50: #f9fafb;
+      --color-gray-500: #6a7282;
+      --color-gray-600: #4a5565;
+      --color-gray-700: #364153;
+      --color-gray-800: #1e2939;
+      --color-gray-900: #101828;
+      --color-green-100: #dcfce7;
+      --color-green-200: #b9f8cf;
+      --color-green-400: #05df72;
+      --color-green-50: #f0fdf4;
+      --color-green-500: #00c950;
+      --color-green-600: #00a63e;
+      --color-green-700: #008236;
+      --color-green-800: #016630;
+      --color-red-100: #ffe2e2;
+      --color-red-200: #ffc9c9;
+      --color-red-300: #ffa2a2;
+      --color-red-400: #ff6467;
+      --color-red-50: #fef2f2;
+      --color-red-500: #fb2c36;
+      --color-red-600: #e7000b;
+      --color-red-700: #c10007;
+      --color-red-800: #9f0712;
+      --color-slate-100: #f1f5f9;
+      --color-slate-200: #e2e8f0;
+      --color-slate-300: #cad5e2;
+      --color-slate-400: #90a1b9;
+      --color-slate-50: #f8fafc;
+      --color-slate-500: #62748e;
+      --color-slate-700: #314158;
+      --color-slate-800: #1d293d;
+      --color-teal-100: #cbfbf1;
+      --color-teal-300: #46ecd5;
+      --color-teal-600: #009689;
+      --color-teal-700: #00786f;
+      --color-yellow-200: #fff085;
+      --color-yellow-50: #fefce8;
+      --color-yellow-700: #a65f00;
+      --color-yellow-800: #894b00;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   Read-only strategy view (the eye icon's popup in Algo Trade).
+
+   The popup mounts the REAL StrategyBuilder so that whatever the user
+   configured shows exactly as the builder renders it — every strategy type,
+   Range Breakout, sequential and lazy legs included — instead of a second
+   layout that would drift from the builder.
+
+   `readOnly` on that instance adds .strategy-readonly and hides the two
+   chrome blocks; everything below is presentation only. Nothing here applies
+   to the live builder, which never gets the class.
+   --------------------------------------------------------------------------- */
+
+/* Data Selection and the fixed action bar. The bar is position: fixed, so left
+   in place it escapes the modal entirely and sits at the foot of the SCREEN,
+   offering Save As New / Update / Start Backtest / Compare Backtest beneath a
+   dialog that has its own buttons.
+
+   Two classes, because the two popups differ: .strategy-readonly also greys
+   every control, while .builder-in-dialog (the editable pencil popup) only
+   wants the chrome gone. */
+.strategy-readonly [data-builder-chrome],
+.builder-in-dialog [data-builder-chrome] { display: none !important; }
+
+/* The builder reserves a full screen and 4rem of bottom padding for that fixed
+   bar. With the bar hidden inside a dialog, both are empty space the user has
+   to scroll past. */
+.builder-in-dialog .min-h-screen { min-height: 0 !important; }
+.builder-in-dialog .pb-16 { padding-bottom: 0 !important; }
+
+/* Grey the controls. The builder's own disabled styling is per-field
+   (disabled:opacity-40) and keyed off each toggle, so it cannot express "the
+   whole strategy is locked" — this dims the controls without touching the
+   labels, which keeps the configuration readable and the PDF legible. */
+.strategy-readonly input,
+.strategy-readonly select,
+.strategy-readonly textarea,
+.strategy-readonly button {
+  opacity: 0.55;
+  filter: grayscale(0.15);
+}
+
+/* Inertness is enforced by the `inert` attribute on the popup's wrapper, which
+   also removes the subtree from the tab order. pointer-events here is the
+   fallback for engines without `inert`, so a click can never reach a control
+   even if the attribute is ignored. The popup's own scroll container is an
+   ancestor, so scrolling the view still works. */
+.strategy-readonly {
+  pointer-events: none;
+}
+
+.strategy-readonly,
+.strategy-readonly * {
+  cursor: default !important;
+  user-select: none;
+}
+
+/* ---------------------------------------------------------------------------
+   Narrow / rotated screens.
+
+   A monitor turned portrait gives a ~1080px viewport, and the Algo Trade and
+   portfolio tables were built around fixed minimum widths (1540px, 1180px,
+   1120px). On that screen they overflowed, so the row actions — Activate,
+   Edit, Setup Execution — sat off the right edge and had to be scrolled to.
+
+   This is done entirely with media queries: no resize listeners, no state, no
+   re-renders. The desktop layout below 1280px is the ONLY thing that changes;
+   at wider widths every rule here is inert, so the horizontal-PC appearance is
+   untouched.
+   --------------------------------------------------------------------------- */
+
+/* The deploy / auto-activation table's desktop track. Moved out of the
+   component so the media query below can restate it — an inline style cannot
+   be overridden by a stylesheet. */
+.deploy-grid {
+  grid-template-columns:
+    36px minmax(170px, 1.2fr)
+    minmax(206px, 1fr) minmax(206px, 1fr) minmax(206px, 1fr)
+    minmax(206px, 1fr) minmax(206px, 1fr) minmax(206px, 1fr);
+}
+
+@media (max-width: 1280px) {
+  /* Let the tables use the width they actually have. */
+  .deploy-table-wide { min-width: 0 !important; }
+  .algo-table-wide { min-width: 0 !important; }
+
+  /* Columns shrink to what their content needs rather than to a desktop
+     minimum, so every column — including the actions — stays on screen. */
+  .deploy-grid {
+    grid-template-columns:
+      28px minmax(92px, 1.4fr)
+      minmax(56px, 0.7fr) minmax(122px, 1fr) minmax(90px, 0.9fr)
+      minmax(90px, 0.9fr) minmax(48px, 0.5fr) minmax(100px, 1fr);
+    column-gap: 8px;
+    padding-left: 8px;
+    padding-right: 8px;
+    /* 11px rather than 13px: "09:55:00 AM" plus its pencil needs 101px at
+       13px but only ~86px here, which is what lets the time columns fit
+       without dropping the seconds from the value. */
+    font-size: 11px;
+  }
+
+  /* The Algo Trade rows stay on ONE line, exactly as they do on the desktop.
+     
+     Three pills at their desktop sizes (144 + 144 + 81 = 385px) cannot fit the
+     trailing column at this width, so the pills themselves get smaller —
+     11px labels, 8px padding, natural width — rather than the row growing a
+     second line for them. At that size all three need ~245px, which the
+     column below reserves. Nothing is hidden, nothing is renamed, and the row
+     keeps its normal height. */
+  .algo-st-grid {
+    grid-template-columns:
+      minmax(0, 1.5fr) minmax(88px, 0.9fr) minmax(70px, 0.7fr)
+      minmax(120px, 1.1fr) minmax(170px, 1.2fr);
+  }
+
+  .algo-pf-grid {
+    grid-template-columns:
+      minmax(0, 1.2fr) minmax(70px, 0.8fr) minmax(58px, 0.6fr)
+      minmax(76px, 0.8fr) minmax(248px, 1.6fr);
+  }
+
+  /* A real gap between the last data column and the actions. The columns sat
+     flush, so the buttons cleared the execution dots by only a few pixels and
+     read as though they were touching them. There is spare width at the end of
+     the row, so it is spent here. */
+  .algo-st-grid,
+  .algo-pf-grid {
+    column-gap: 16px;
+  }
+
+  .algo-st-grid > :nth-child(5),
+  .algo-pf-grid > :nth-child(5) {
+    flex-wrap: nowrap;
+    justify-content: flex-end;
+    gap: 6px;
+  }
+
+  .algo-st-grid > :nth-child(5) button,
+  .algo-pf-grid > :nth-child(5) button {
+    width: auto !important;
+    min-width: 0;
+    height: 28px;
+    padding-left: 8px;
+    padding-right: 8px;
+    font-size: 11px;
+  }
+
+  /* Seven day circles need 186px at the desktop's 24px + 3px gap. At 16px
+     with a 1px gap they need 118px, which fits the narrowed Weekdays column. */
+  .deploy-grid [class*="rounded-full"].shrink-0 {
+    width: 16px;
+    height: 16px;
+    font-size: 8px;
+  }
+  .deploy-grid [class*="rounded-full"].shrink-0:not(:first-child) {
+    margin-left: -2px;   /* trims the 3px gap to 1px without touching the JSX */
+  }
+
+  /* The portfolio page's setting row already wraps below xl, and its action
+     bar already carries flex-wrap, so neither needs a rule here.
+
+     Its controls do carry hand-tuned nudges though — -ml-20 on the Slippage
+     column, -left-[105px] on the index select, -left-6 on the Slippage
+     dropdown. Each aligns a control with the row beneath it in the WIDE
+     layout. Once the row wraps those offsets have nothing to line up with and
+     simply drag one control on top of another, which is what put Slippage over
+     Weekdays. Neutralised here, and only here. */
+  .pf-nudge {
+    margin-left: 0 !important;
+    margin-right: 0 !important;
+    left: 0 !important;
+  }
+
+  /* The setting row and the strategy rows beneath it stay on ONE line — the
+     row wrapping is what dropped Slippage onto a second line. At the desktop's
+     24px gaps the controls need ~837px against ~772px available, so the gaps
+     and the two widest dropdowns tighten just enough to fit. */
+  .pf-settings-row,
+  .pf-strategy-row {
+    gap: 12px !important;
+    padding-left: 12px;
+    padding-right: 12px;
+  }
+
+  .pf-settings-row .w-32 { width: 6.5rem; }
+  .pf-settings-row select,
+  .pf-settings-row button { font-size: 11px; }
+
+  /* The strategy row's seven day circles are 32px on a 10px gap = 284px. That
+     is what pushed the row's children past its padding box and left the delete
+     icon hanging outside the card. 26px on a 6px gap = 218px gives back the
+     66px the row was short. The Weekdays dropdown above them keeps its own
+     width, so the columns still line up. */
+  .pf-strategy-row .w-8.rounded-full {
+    width: 26px;
+    height: 26px;
+    font-size: 10px;
+  }
+
+  .pf-strategy-row .flex-1 {
+    gap: 6px !important;
+  }
+}
+
+
+/* ---------------------------------------------------------------------------
+   Container queries: respond to the space actually available.
+
+   Tailwind's md:/lg:/xl: prefixes measure the VIEWPORT, but these panes sit
+   beside a ~260px sidebar — so at an 800px window with the sidebar open the
+   builder has ~540px to work with while `md:` (768px) fires as though it had
+   800. That is the whole reason the page looks right with the sidebar closed
+   and breaks with it open: same viewport, very different content width.
+
+   Measuring the container instead makes the layout correct in BOTH states, at
+   any window size, with no JavaScript and no knowledge of the sidebar.
+   --------------------------------------------------------------------------- */
+
+#strategy-pdf-content,
+#strategy-readonly-content {
+  container-type: inline-size;
+  container-name: builderpane;
+}
+
+/* KEEP the original two-column structure — Instrument + Legwise beside Entry
+   settings — and make it FIT rather than stacking it.
+   
+   Measured at an 835px container (1080px window, sidebar open): the 39% column
+   lands at 326px and is 18px short, the 61% column at 509px and 19px short.
+   The cards inside carry 32px of padding, so trimming that to 20px returns
+   24px per card — more than the shortfall — and the layout keeps the shape it
+   has on a wide screen. */
+@container builderpane (max-width: 1200px) {
+  /* 39% + 61% = 100% of the track, and then gap-6 adds 24px on top — so the
+     row is always its own gap too wide, and at 835px that pushed Entry
+     settings 24px past the edge. fr units divide what is left AFTER the gap,
+     which is what percentages cannot do. Same 39/61 proportions. */
+  .builder-two-col {
+    grid-template-columns: minmax(0, 39fr) minmax(0, 61fr) !important;
+  }
+
+  .builder-two-col .p-8 {
+    padding: 16px !important;
+  }
+
+  /* The Entry settings card uses px-8/pt-10/pb-6, not p-8, so it needs its own
+     rule — trimming only the horizontal padding, which is the axis that is
+     short. */
+  .builder-two-col .px-8 {
+    padding-left: 14px !important;
+    padding-right: 14px !important;
+  }
+
+  /* The Entry/Exit pair is separated by a PERCENTAGE gap (10.5%). On a wide
+     card that is pleasant spacing; on a 465px card it is 49px — which was
+     exactly the shortfall that cut "trading days before expiry" off the
+     Positional layout. A fixed gap keeps the same arrangement and gives the
+     width back. */
+  .entry-exit-row {
+    gap: 16px !important;
+  }
+
+  /* The leg field rows wrap. Four groups need 1199px (248 x 3 + 383, plus
+     24px gaps) and the row has 821px, so matching the desktop's single row
+     would mean shrinking the controls to 68% — unreadable. Tightening the gap
+     instead fits THREE groups per row at full size rather than two, which is
+     as close to the desktop grouping as this width allows without shrinking
+     anything. The widest group (Range Breakout) takes the next line. */
+  .leg-field-row {
+    column-gap: 12px !important;
+  }
+
+  /* The leg's top row — Lots, Position, Option Type, Expiry, Select Strike
+     Criteria and the strike value — needs 808px at its 20px gaps but has 771,
+     so the strike value (ATM) dropped to a second line. 12px brought it to
+     768 against 771 — three pixels, which sub-pixel rounding swallowed and the
+     row still wrapped. 8px leaves 23px of real headroom. */
+  .leg-top-row {
+    /* 4px rather than 8: with "Based On ATM %" or a premium range the row also
+       carries a sub-field group (180px), taking it to 824px against 771. The
+       tighter gap plus the narrower criteria select below bring it back under,
+       so the strike value stays on the same line as its criteria — as it is on
+       a wide screen. */
+    /* 776px of content plus five 4px gaps is 796 against a 793px row — three
+       pixels short. 2px gaps bring it to 786 with room to spare. */
+    column-gap: 2px !important;
+  }
+
+  /* The "# 1" badge overlaps the first field by 13px horizontally AND 8px
+     vertically. Padding the row to clear it horizontally cost 38px of row
+     width — which is what pushed the strike sub-fields onto a second line.
+     Lifting the badge clear of the row instead costs the row nothing, and a
+     collision needs BOTH overlaps, so removing the vertical one is enough. */
+  .leg-badge {
+    top: 2px;
+  }
+
+  /* The leg's content sits inside 25px of padding each side, leaving the top
+     row 771px. "Based On premium range" adds a Lower/Upper pair and needs
+     776px — five pixels short. Trimming that padding to 14px gives the row
+     795px, so the widest criteria keeps its inputs on the same line without
+     shrinking any control. The badge is clear of the row vertically, so
+     narrowing the padding cannot bring it back into collision. */
+  .leg-content {
+    padding-left: 8px !important;
+    padding-right: 8px !important;
+  }
+
+  /* The criteria select stays at its full 13.5rem (216px): its longest option,
+     "Based On Closest Premium", measures 167px of text plus 46px of padding
+     and chevron = 213px. Narrowing it to buy row width truncated that label,
+     so the width is taken from the range inputs below instead. */
+
+  /* The room the full-width select needs is taken from the three controls that
+     are wider than their own content, so nothing is truncated anywhere:
+
+       Position  84px holds "Buy"/"Sell"        -> needs 70px  (24 text + 46 pad)
+       Type      84px holds "Call"/"Put"        -> needs 70px
+       Expiry   136px holds "Weekly"/"Monthly"  -> needs 129px
+
+     That frees 30px; the criteria select needs 3px more than the 216px it had.
+     The Lower/Upper Range columns are sized by their labels, not their inputs,
+     so they are left alone -- shrinking the inputs inside them would just
+     detach them from their own column. */
+  /* Each select reserves 32px on the right for its chevron -- generous, and
+     multiplied across four selects it was most of the row's width. 22px still
+     clears the chevron and hands ~40px back to the row. */
+  .leg-top-row select {
+    padding-right: 22px !important;
+  }
+
+  /* Dropping the labels one step (13 -> 12px) is what stops them colliding:
+     "Option Type" measured 76px against its own 72px select, so the LABEL, not
+     the control, was setting that column's width and running into "Expiry". */
+  .leg-content label {
+    font-size: 12px !important;
+  }
+
+  /* With the trimmed padding each control is resized to what it actually
+     holds, so the width freed up becomes real spacing between the columns:
+
+       Lots / Position / Type  60px  holds "1" / "Buy" / "Call" (24 + 36 pad)
+       Expiry                 120px  holds "Weekly" (84 + 36)
+       Strike criteria        208px  holds "Based On Closest Premium" (169 + 36)
+       Lower / Upper Range     80px  each, clearing their 75px labels */
+  .leg-top-row .w-\[5\.25rem\] {
+    width: 3.75rem !important;  /* 60px */
+  }
+
+  .leg-top-row .w-\[8\.5rem\] {
+    width: 7.5rem !important;   /* 120px */
+  }
+
+  /* The Lower/Upper Range pair is two w-[6.5rem] (104px) COLUMNS, each holding
+     a label above a full-width input. Shrinking the input alone just detached
+     it from its column, so the column itself is what shrinks -- 80px still
+     clears its 75px label. */
+  .leg-top-row .w-\[6\.5rem\] {
+    width: 5rem !important;   /* 80px */
+  }
+
+  /* The columns sat 2px apart, which is why the labels above them read as one
+     run-on string ("Option TypeExpiry"). The resizing above leaves room for a
+     proper gap. */
+  .leg-top-row {
+    column-gap: 14px !important;
+  }
+
+
+  /* "trading days before expiry" is nowrap and overran its cell by 18px.
+     Letting it wrap keeps it inside the card instead of being cut. */
+  .entry-exit-row .whitespace-nowrap,
+  .entry-exit-row label + div span,
+  .entry-exit-row span {
+    white-space: normal !important;
+  }
+
+  /* Wrapped lines inside a field row fall back to gap-y-3 (12px), which reads
+     as no separation at all next to the 20px (mt-5) that divides one row from
+     the next. Matching them keeps the rhythm of the original. */
+  .leg-field-row,
+  .leg-top-row {
+    row-gap: 20px !important;
+  }
+
+  /* Add Sequential Leg sits in its own flex column after the fields. Letting
+     it stretch the full width lets `self-end` put it hard against the card's
+     bottom-right corner, where the wide layout has it. */
+  .leg-seq-row {
+    width: 100%;
+  }
+
+  /* That row also carries pl-[10.5%] — 86px of its 821px — to line its fields
+     up with the row above on a wide card. It left only 735px where three
+     groups need 768, so the third wrapped. The indent is a wide-screen
+     alignment aid with nothing to align to here, so it is dropped and the row
+     holds three groups at full size. */
+  .leg-field-row {
+    padding-left: 0 !important;
+  }
+
+  /* The leg card's close/duplicate controls hang 10px outside the card by
+     design (-top-2.5 -right-2.5). On a wide page there is margin to absorb
+     that; here the Legs column needs the same 10px so they do not push the
+     section past its container. */
+  .builder-legs-pad {
+    padding-right: 12px;
+  }
+}
+
+/* Only genuinely narrow containers stack, where no amount of trimming fits two
+   columns side by side. */
+@container builderpane (max-width: 700px) {
+  .builder-two-col {
+    grid-template-columns: 1fr !important;
+  }
+}
+
+/* Overall strategy settings is three blocks of 320 + 320 + the rest. The third
+   is Trail SL, which carries a mode select plus TWO number inputs and needs
+   ~240px; at an 835px container it was handed 147px and clipped by 151px.
+   Three columns therefore need ~930px, two need ~680px. */
+@container builderpane (max-width: 1200px) {
+  .builder-overall-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  }
+}
+
+@container builderpane (max-width: 680px) {
+  .builder-overall-grid {
+    grid-template-columns: 1fr !important;
+  }
+}
+
+/* The Algo Trade tables size to their own container too, so the sidebar being
+   open or closed changes nothing about whether the row fits. */
+.algo-table-wide,
+.deploy-table-wide {
+  container-type: inline-size;
+  container-name: algotable;
+}
+
+/* Under ~620px the fixed minimums (88 + 70 + 120 + 170 + gaps) consumed the
+   whole row and squeezed the strategy NAME to nothing, so the name spilled
+   across Status and Instances — which is what made "0 Deployed" look like it
+   was overlapping. Everything gives up a little so the name keeps a real
+   minimum. */
+@container algotable (max-width: 900px) {
+  /* Sized to what the content measures at this scale: a shrunk status chip
+     ~110px, seven 18px dots on a 2px gap 138px, and two 13px pills 168px. */
+  .algo-st-grid {
+    grid-template-columns:
+      minmax(118px, 1.3fr) minmax(108px, 1fr) minmax(100px, 0.8fr)
+      minmax(146px, 1.1fr) minmax(170px, 1.2fr);
+    column-gap: 10px;
+  }
+
+  .algo-pf-grid {
+    grid-template-columns:
+      minmax(104px, 1.1fr) minmax(72px, 0.7fr) minmax(54px, 0.5fr)
+      minmax(72px, 0.7fr) minmax(244px, 1.6fr);
+    column-gap: 10px;
+  }
+
+  /* The status chip is a fixed 211px to match the reference; at this width it
+     overflowed its column by 56px, so it sizes to its label instead. */
+  .algo-st-grid > :nth-child(2) > * {
+    width: auto !important;
+    min-width: 0;
+    max-width: 100%;
+    padding-left: 6px;
+    padding-right: 6px;
+  }
+
+  /* Seven 28px dots need 196px; 18px on a 2px gap needs 138px. */
+  .algo-st-grid > :nth-child(4) [class*="rounded-full"] {
+    width: 18px;
+    height: 18px;
+    font-size: 8px;
+  }
+  .algo-st-grid > :nth-child(4) > * {
+    gap: 2px !important;
+  }
+
+  /* Pills a little smaller, as you asked, so they stay on one line. */
+  .algo-st-grid > :nth-child(5) button,
+  .algo-pf-grid > :nth-child(5) button {
+    height: 26px;
+    padding-left: 7px;
+    padding-right: 7px;
+    font-size: 11px;
+  }
+
+  .algo-st-grid > :nth-child(5),
+  .algo-pf-grid > :nth-child(5) {
+    gap: 5px;
+  }
+}
+
+
+/* ---------------------------------------------------------------------------
+   Narrow windows: the sidebar OVERLAYS the page instead of taking width.
+
+   Its 195px is the difference between the tables fitting and their columns
+   being crushed — with it open in an 800px window the strategy name column
+   collapsed to 12px and the name spilled across Status and Instances. Lifting
+   it out of the flow means the page is laid out the same whether the menu is
+   open or shut, so there is no longer a "looks right closed, breaks open"
+   divergence to design around.
+   --------------------------------------------------------------------------- */
+@media (max-width: 980px) {
+  .app-shell .app-sidebar {
+    position: absolute;
+    inset-block: 0;
+    left: 0;
+    z-index: 40;
+    box-shadow: 0 0 24px rgba(0, 0, 0, 0.18);
+  }
+}
+
+
+/* ---------------------------------------------------------------------------
+   Even spacing between a leg's field rows, at EVERY width.
+
+   The leg's top row sits inside `.leg-content`; the field rows below it are
+   siblings that come after. So that block's padding-bottom ADDS to the first
+   field row's 20px margin: the gap after the top row measured 50px on the
+   desktop (30px padding + 20px margin) and 30px on a narrow screen, while
+   every later gap was 20px. Zeroing the padding leaves one uniform 20px
+   between every row — the even rhythm the reference has — on the desktop and
+   the rotated screen alike.
+   --------------------------------------------------------------------------- */
+.leg-content {
+  padding-bottom: 0 !important;
+}
+
+
+/* ---------------------------------------------------------------------------
+   Field geometry, read off AlgoTest's own Strategy Builder.
+
+   Done here rather than in the JSX because the builder has 48 selects across
+   ~28 class combinations; one rule per property is both safer and easier to
+   keep true than editing each call site.
+
+   Specificity is deliberate:
+     - border-radius and padding are never set inline, so an id selector beats
+       the Tailwind classes without !important -- which in turn lets the
+       portrait container query's own "!important" padding-right still win.
+     - border-color IS set inline (colors.settingsPanel.fieldBorder), so that
+       one needs !important to take effect.
+   --------------------------------------------------------------------------- */
+
+/* 4px, not the 6px of rounded-md. Cards stay at 6px: AlgoTest's own card is
+   rounded-md, only the fields inside it are 4px. */
+#strategy-pdf-content select,
+#strategy-pdf-content input:not([type="checkbox"]):not([type="radio"]),
+#strategy-readonly-content select,
+#strategy-readonly-content input:not([type="checkbox"]):not([type="radio"]) {
+  border-radius: 4px;
+}
+
+/* AlgoTest gives selects a DARKER border than inputs -- #D4D4D4
+   (--primaryBlack-500) against #E3E3E3 (--primaryBlack-350). Scoping this to
+   `select` keeps inputs on the lighter one, which they already match.
+
+   Horizontal padding is 12px / 40px, where this had 14px / 32px. The portrait
+   container query trims the right side back to 22px, which is what keeps the
+   six leg fields on one line at 1080px -- its !important beats this. */
+#strategy-pdf-content select,
+#strategy-readonly-content select {
+  border-color: #D4D4D4 !important;
+  padding-left: 12px;
+  padding-right: 40px;
+  /* 34px tall, uniformly, as AlgoTest's are. Ours were a mix of h-8 (32px)
+     and h-9 (36px); theirs report 34px across every select on the page.
+
+     This is the one change here with a VERTICAL effect: each row holding a
+     select grows ~2px, so a leg card gains roughly 6px and the panels below
+     shift down. The Add Sequential button is positioned by flex within the
+     card, so its corner insets (17px right, 15px bottom, 20px clear above)
+     move with the card rather than changing. */
+  height: 34px;
+}
+
+/* 12px field text (AlgoTest's text-xs), where this ran at 13-14px. Only the
+   VALUES move -- labels keep their own size, which the portrait container
+   query already drops to 12px on its own.
+
+   This cannot cost the rotated screen any room: the field boxes are sized by
+   explicit width classes, not by their content, so smaller text only adds
+   slack inside them. Measured: the longest criteria option is 169px at 13px
+   and 156px at 12px, inside a box whose inner width is 182px either way. */
+#strategy-pdf-content select,
+#strategy-pdf-content input:not([type="checkbox"]):not([type="radio"]),
+#strategy-readonly-content select,
+#strategy-readonly-content input:not([type="checkbox"]):not([type="radio"]) {
+  font-size: 12px;
+}
+
+/* Field labels: 12px at weight 400, read off AlgoTest's own ("Index",
+   "Entry Time", "Strategy Type" all report 12px/400 in #3A3A3A). This ran at
+   13px and font-medium (500), so the labels were both larger and heavier.
+
+   Line-height is deliberately left alone: theirs is a mix of 16px and 24px
+   depending on the row, and overriding it here would shift the vertical
+   rhythm of every settings panel for no colour or sizing gain.
+
+   Like the field rule above, this only frees horizontal room -- a narrower,
+   lighter label can never push a row wider -- so the rotated screen's
+   one-line fit is unaffected. */
+#strategy-pdf-content label,
+#strategy-readonly-content label {
+  font-size: 12px;
+  font-weight: 400;
+}
+
+/* Inputs share the selects' 34px height. AlgoTest's number inputs measure
+   64x34 -- the same height as their selects -- and when the select rule above
+   moved selects from 32px to 34px, the inputs beside them (Lower/Upper Range,
+   Premium, ATM %) were left behind at h-8 and the first leg row stopped
+   lining up.
+
+   Safe to apply broadly: TimeSegmentInput contains no <input> at all (it is
+   built from spans), so the time pickers cannot be caught by this. Checkboxes
+   and radios are excluded, as they are everywhere else here. */
+#strategy-pdf-content input:not([type="checkbox"]):not([type="radio"]),
+#strategy-readonly-content input:not([type="checkbox"]):not([type="radio"]) {
+  height: 34px;
+}
+
+/* ---------------------------------------------------------------------------
+   Create New Lazy Leg / Create Sequential Leg popups: rows 2 and 3 line up.
+
+   Both rows were `flex flex-wrap justify-center`, so each centred ITSELF. Their
+   field groups differ in width (Trail SL carries two inputs, Re-entry a select
+   plus a count), so the two rows centred to different left edges and Re-entry
+   on Tgt sat to the right of Target Profit instead of beneath it.
+
+   Three equal columns in both rows makes them centre identically, so the
+   Target / Stop Loss / Trail SL column heads sit directly above Re-entry on
+   Tgt / Re-entry on SL / Simple Momentum.
+
+   Scoped to the popups on purpose: inside them BOTH rows always carry exactly
+   three groups, which is the case that aligns cleanly. The leg cards on the
+   page are left alone -- a main leg there has three groups in row 2 and four in
+   row 3, so the same treatment cannot line them up.
+
+   940px is about the span these rows already occupy inside the 1280px dialog;
+   without it three columns would stretch the full body width and push the
+   fields far apart.
+   --------------------------------------------------------------------------- */
+/* The same treatment for lazy and sequential leg CARDS on the page, which have
+   the same shape as the popups: exactly three field groups in both rows.
+
+   TWO selectors because the two card types render different markup: a
+   sequential leg's rows carry `leg-field-row`, while a lazy leg takes an
+   entirely separate branch in LegCard and carries `leg-lazy-row`. Tagging only
+   the first matched nothing on lazy cards, which is why they stayed unaligned
+   after the first attempt.
+
+   Scoped to those cards on purpose. A MAIN leg has three groups in row 2 but
+   four in row 3 (Range Breakout), and that fourth group is far wider than a
+   quarter of the row -- a grid would overflow it rather than wrap, where the
+   current flex layout wraps cleanly. Main legs therefore keep `justify-center`
+   and are untouched. */
+.leg-aligned-rows .leg-lazy-row,
+.leg-aligned-rows .leg-field-row {
+  display: grid !important;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  justify-items: start;
+  align-items: start;
+  max-width: 820px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.modal-field-row {
+  display: grid !important;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  /* start, not center: centring each group inside its column aligned the rows
+     by their CENTRES, so groups of different widths still began at different
+     x. Anchoring them to the column's left edge makes the left edges stack,
+     which is what lines Re-entry on Tgt up under Target Profit. */
+  justify-items: start;
+  align-items: start;
+  max-width: 940px;
+  margin-left: auto;
+  margin-right: auto;
+}
+/* ---------------------------------------------------------------------------
+   Add Sequential Leg sits in the leg card's bottom-right corner.
+
+   It carried 10px of its own padding on top of the card's 24px, leaving it
+   34px above the border — floating in the middle of the card's foot rather
+   than tucked into the corner. Pulling it down leaves a small, even margin
+   below it on the desktop and the rotated screen alike.
+   --------------------------------------------------------------------------- */
+.leg-seq-row {
+  padding-bottom: 0 !important;
+  margin-bottom: -10px;
+  /* The row's own padding held the button 25px short of the fields' right
+     edge; zeroing it put the button hard against the card's border, with no
+     white space beside it. 16px is the middle ground -- clearly tucked into
+     the corner, but not cut off by the edge. */
+  padding-right: 16px !important;
+  /* The button began at the same y the last field row ended -- on the desktop
+     as well as the rotated screen -- so it read as crowding those fields. The
+     same 20px the other rows use sets it clearly below them. */
+  margin-top: 20px;
+}
+
+
+/* ---------------------------------------------------------------------------
+   Day wise / Trade wise stat blocks on a narrow pane.
+
+   Their Tailwind columns key off the VIEWPORT (lg:grid-cols-3 = 1024px), but
+   what constrains them is the content pane beside the sidebar -- ~835px when
+   the sidebar is open at 1080px. Three columns there leave ~270px each and the
+   figures clip. These measure the pane itself.
+   --------------------------------------------------------------------------- */
+@container builderpane (max-width: 1000px) {
+  .stats-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  }
+}
+
+@container builderpane (max-width: 640px) {
+  .stats-grid {
+    grid-template-columns: 1fr !important;
+  }
 }

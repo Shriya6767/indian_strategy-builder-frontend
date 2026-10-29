@@ -1,11 +1,15 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { X, Search } from 'lucide-react';
-import { API_URL } from '../services/api';
+import { colors } from '../theme/colors';
 import { usePortfolio } from '../context/PortfolioContext';
+import { useSavedStrategies } from '../context/SavedStrategiesContext';
+import { fetchStrategies as fetchLibraryStrategies } from '../services/libraryApi';
 import logger from '../utils/logger';
 
-const CreatePortfolioModal = ({ isOpen, onClose, onCreatePortfolio }) => {
-  const { addPortfolio } = usePortfolio();
+const CreatePortfolioModal = ({ isOpen, onClose, onCreatePortfolio, onCreateNewStrategy, onShowToast }) => {
+  const { portfolios } = usePortfolio();
+  const { strategies: contextStrategies } = useSavedStrategies();
+  const [nameError, setNameError] = useState('');
   const [portfolioName, setPortfolioName] = useState('');
   const [activeTab, setActiveTab] = useState('My Strategies');
   const [searchQuery, setSearchQuery] = useState('');
@@ -20,18 +24,33 @@ const CreatePortfolioModal = ({ isOpen, onClose, onCreatePortfolio }) => {
   }, [isOpen]);
 
   const fetchStrategies = async () => {
-    setLoading(true); 
+    setLoading(true);
     try {
-      const savedStrategies = localStorage.getItem('saved_strategies_cards');
-      
-      if (savedStrategies) {
-        const strategies = JSON.parse(savedStrategies);
-        setStrategies(Array.isArray(strategies) ? strategies : []);
-      } else {
-        setStrategies([]);
+      let serverRows = [];
+      try {
+        serverRows = await fetchLibraryStrategies();
+      } catch (error) {
+        // A failed read must not empty the dialog -- fall back to the cards,
+        // which is what it showed before, rather than to nothing.
+        logger.error('[CreatePortfolioModal] could not load the library:', error);
       }
+      const byName = new Map();
+      const add = (item) => {
+        const key = (item?.name || '').trim().toLowerCase();
+        if (!key) return;
+        const seen = byName.get(key);
+        if (!seen || new Date(item.created_at || 0) >= new Date(seen.created_at || 0)) {
+          byName.set(key, item);
+        }
+      };
+      (contextStrategies || []).forEach(add);
+      serverRows.forEach(add);
+
+      setStrategies([...byName.values()].sort(
+        (a, b) => String(a.name || '').localeCompare(String(b.name || '')),
+      ));
     } catch (error) {
-      logger.error('❌ Error loading strategies from localStorage:', error);
+      logger.error('Error reading the saved strategies:', error);
       setStrategies([]);
     } finally {
       setLoading(false);
@@ -58,130 +77,66 @@ const CreatePortfolioModal = ({ isOpen, onClose, onCreatePortfolio }) => {
     );
   };
 
+  /** Shown under the field, and the reason the button refuses. */
+  const NAME_TAKEN_MESSAGE = 'This name already exists. Please give a different name.';
+
+  /** A portfolio already goes by this name. Blank is not a clash -- the
+   *  empty-field message is a different one. */
+  const nameTaken = (name) => {
+    const key = String(name ?? '').trim().toLowerCase();
+    if (!key) return false;
+    return portfolios.some(
+      (p) => (p.portfolio_name || '').trim().toLowerCase() === key,
+    );
+  };
+
   const handleCreatePortfolio = async () => {
     if (!portfolioName.trim()) {
-      alert('Please enter a portfolio name');
+      onShowToast?.('Please fill the name field', 'error');
+      return;
+    }
+    // Under the field rather than in a toast: the field is what has to change,
+    // and a toast about it leaves the user looking for which one.
+    if (nameTaken(portfolioName)) {
+      setNameError(NAME_TAKEN_MESSAGE);
       return;
     }
     if (selectedStrategies.length === 0) {
-      alert('Please select at least one strategy');
+      onShowToast?.('Please select at least one strategy', 'error');
       return;
     }
-    
-    try {
-      setLoading(true);
-      
-      const payload = {
-        portfolio_name: portfolioName.trim(),
-        strategies: selectedStrategies.map(strategyId => {
-          const strategy = strategies.find(s => s.id === strategyId);
-          return {
-            strategy_id: strategyId,
-            strategy_name: strategy?.name || '',
-            version: strategy?.version || 1  // Default to version 1 if not present
-          };
-        })
+    const toRow = (strategyId) => {
+      const strategy = strategies.find((s) => s.id === strategyId);
+      return {
+        id: strategy?.id || strategyId,
+        strategy_id: strategyId,
+        name: strategy?.name || '',
+        strategy_name: strategy?.name || '',
+        version: strategy?.version || 1,
+        symbol: strategy?.symbol || 'sensex',
+        strategy_type: strategy?.strategy_type || 'intraday',
+        qty: strategy?.qty || 1,
+        quantity_multiplier: strategy?.quantity_multiplier || 1,
+        weekdays: strategy?.weekdays || {},
+        selectedDTEs: strategy?.selectedDTEs || [0],
+        selectedBudgetDays: strategy?.selectedBudgetDays || [],
+        budgetPct: strategy?.budgetPct || 0,
+        slippage_percent: strategy?.slippage_percent || 0,
+        selected: true,
       };
+    };
 
-      logger.request('[SAVE PORTFOLIO] Request', {
-        method: 'POST',
-        url: `${API_URL}/save-portfolio`,
-        body: payload
+    const rows = selectedStrategies.map(toRow);
+
+    handleClose();
+    // After the dialog has gone, so the detail page mounts on a clean screen.
+    setTimeout(() => {
+      onCreatePortfolio({
+        id: null,
+        name: portfolioName.trim(),
+        strategies: rows,
       });
-
-      const response = await fetch(`${API_URL}/save-portfolio`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(payload)
-      });
-
-      let data;
-      try {
-        data = await response.json();
-      } catch (jsonError) {
-        logger.error('❌ Error parsing response JSON:', jsonError);
-        throw new Error('Invalid response from server');
-      }
-      
-      logger.response('[SAVE PORTFOLIO] Response', {
-        status: response.status,
-        data: data
-      });
-
-      if (response.ok && data.portfolio_id) {
-        
-        const newPortfolio = {
-          portfolio_id: data.portfolio_id,
-          portfolio_name: portfolioName.trim(),
-          strategies: selectedStrategies.map(strategyId => {
-            const strategy = strategies.find(s => s.id === strategyId);
-            return {
-              id: strategy?.id || strategyId,
-              strategy_id: strategyId,
-              name: strategy?.name || '',
-              strategy_name: strategy?.name || '',
-              version: strategy?.version || 1,
-              symbol: strategy?.symbol || 'SPXW',
-              strategy_type: strategy?.strategy_type || 'intraday',
-              qty: strategy?.qty || 1,
-              quantity_multiplier: strategy?.quantity_multiplier || 1,
-              weekdays: strategy?.weekdays || {},
-              selectedDTEs: strategy?.selectedDTEs || [0],
-              selectedBudgetDays: strategy?.selectedBudgetDays || [],
-              budgetPct: strategy?.budgetPct || 0,
-              slippage_percent: strategy?.slippage_percent || 0,
-              selected: true
-            };
-          }),
-          createdAt: new Date().toISOString()
-        };
-
-        addPortfolio(newPortfolio);
-
-        const portfolioDataForParent = {
-          id: data.portfolio_id,
-          name: portfolioName.trim(),
-          strategies: selectedStrategies.map(strategyId => {
-            const strategy = strategies.find(s => s.id === strategyId);
-            return {
-              id: strategy?.id || strategyId,
-              strategy_id: strategyId,
-              name: strategy?.name || '',
-              strategy_name: strategy?.name || '',
-              version: strategy?.version || 1,
-              symbol: strategy?.symbol || 'SPXW',
-              strategy_type: strategy?.strategy_type || 'intraday',
-              qty: strategy?.qty || 1,
-              quantity_multiplier: strategy?.quantity_multiplier || 1,
-              weekdays: strategy?.weekdays || {},
-              selectedDTEs: strategy?.selectedDTEs || [0],
-              selectedBudgetDays: strategy?.selectedBudgetDays || [],
-              budgetPct: strategy?.budgetPct || 0,
-              slippage_percent: strategy?.slippage_percent || 0,
-              selected: true
-            };
-          }),
-        };
-        
-        handleClose();
-        
-        setTimeout(() => {
-          onCreatePortfolio(portfolioDataForParent);
-        }, 100);
-      } else {
-        const errorMessage = data.detail || data.message || `Server returned status ${response.status}`;
-        logger.error('❌ Portfolio creation failed:', errorMessage);
-        alert(`Failed to create portfolio: ${errorMessage}`);
-      }
-    } catch (error) {
-      logger.error('❌ Error creating portfolio:', error);
-      const errorMessage = error.message || 'Unknown error occurred';
-      alert(`Error creating portfolio: ${errorMessage}`);
-    } finally {
-      setLoading(false);
-    }
+    }, 100);
   };
 
   const handleClose = () => {
@@ -195,7 +150,7 @@ const CreatePortfolioModal = ({ isOpen, onClose, onCreatePortfolio }) => {
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+    <div className="fixed inset-0 backdrop-blur-sm bg-white/30 flex items-center justify-center z-50">
       <div className="bg-white rounded-lg shadow-xl w-full max-w-3xl mx-4">
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200">
@@ -218,17 +173,29 @@ const CreatePortfolioModal = ({ isOpen, onClose, onCreatePortfolio }) => {
             <input
               type="text"
               value={portfolioName}
-              onChange={(e) => setPortfolioName(e.target.value)}
+              onChange={(e) => {
+                const next = e.target.value;
+                setPortfolioName(next);
+                setNameError(nameTaken(next) ? NAME_TAKEN_MESSAGE : '');
+              }}
               placeholder="Your portfolio name"
-              className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+              className="w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+              style={{ borderColor: nameError ? '#DC2626' : '#d1d5db' }}
             />
+            {nameError && (
+              <p className="mt-1.5 text-[12px]" style={{ color: '#DC2626' }}>{nameError}</p>
+            )}
           </div>
 
           {/* Add Strategy Section */}
           <div className="mb-4">
             <div className="flex items-center justify-between mb-3">
               <h3 className="text-sm font-medium text-gray-700">Add Strategy</h3>
-              <button className="text-sm text-blue-600 hover:text-blue-700 font-medium">
+              <button
+                type="button"
+                onClick={() => { onClose?.(); onCreateNewStrategy?.(); }}
+                className="text-sm text-blue-600 hover:text-blue-700 font-medium"
+              >
                 + New Strategy
               </button>
             </div>
@@ -309,8 +276,11 @@ const CreatePortfolioModal = ({ isOpen, onClose, onCreatePortfolio }) => {
           </button>
           <button
             onClick={handleCreatePortfolio}
-            disabled={loading}
-            className="px-6 py-2 rounded-lg font-medium transition-all bg-blue-700 text-white hover:bg-blue-800 active:scale-95 cursor-pointer shadow-sm disabled:bg-blue-400 disabled:cursor-not-allowed"
+            disabled={loading || nameTaken(portfolioName)}
+            className="px-6 py-2 rounded-lg font-medium transition-all text-white active:scale-95 cursor-pointer shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
+            style={{ backgroundColor: colors.legBuilder.addLegBg }}
+            onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = colors.legBuilder.addLegHoverBg; }}
+            onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = colors.legBuilder.addLegBg; }}
           >
             {loading ? 'Creating...' : 'Create Portfolio'}
           </button>

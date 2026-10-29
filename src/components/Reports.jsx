@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { FileText, Download, Trash2, Calendar, RefreshCw } from 'lucide-react';
 import { ReportCardSkeleton } from './SkeletonLoader';
 import Tooltip from './Tooltip';
@@ -140,7 +140,7 @@ const Reports = ({ onSwitchToBuilder }) => {
       return;
     }
 
-    if (!window.confirm(`⚠️ FINAL WARNING ⚠️\n\nThis will permanently delete all ${reports.length} reports.\n\nClick OK to proceed.`)) {
+    if (!window.confirm(`FINAL WARNING\n\nThis will permanently delete all ${reports.length} reports.\n\nClick OK to proceed.`)) {
       return;
     }
 
@@ -319,7 +319,9 @@ const Reports = ({ onSwitchToBuilder }) => {
               <div className="flex justify-between items-center">
                 <span className="text-sm text-gray-600 flex items-center">
                   ROI
-                  <Tooltip id={`roi-${index}`} content="Return on Investment - percentage gain/loss relative to initial capital" />
+                  {/* Reported by the backend on the saved report — the frontend
+                      does not compute it, and there is no capital to base it on. */}
+                  <Tooltip id={`roi-${index}`} content="Return on Investment, as reported by the backend for this backtest" />
                 </span>
                 <span className={`text-lg font-bold ${report.roi >= 0 ? 'text-green-600' : 'text-red-600'}`}>
                   {report.roi?.toFixed(2)}%

@@ -1,4 +1,9 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
+import MonthlyStatsTable from './MonthlyStatsTable';
+import ReportPager from './ReportPager';
+import { legRows, summaryFromRows, monthlyFromRows } from '../utils/portfolioStats';
+import { X, Download } from 'lucide-react';
+import { colors } from '../theme/colors';
 import { 
   LineChart, 
   Line, 
@@ -6,9 +11,12 @@ import {
   YAxis, 
   CartesianGrid, 
   Tooltip, 
-  ResponsiveContainer,
-  Legend 
+  ResponsiveContainer 
 } from 'recharts';
+
+// Custom dropdown chevron (appearance-none hides the clipped native arrow).
+const selectChevron = (strokeColor) =>
+  `url("data:image/svg+xml;charset=UTF-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='${strokeColor}' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E")`;
 
 const PortfolioBacktestResults = ({ 
   results, 
@@ -18,25 +26,38 @@ const PortfolioBacktestResults = ({
   strategies,
   dteTab,
   qtyMultiplier,
-  slippage
+  slippage,
+  /*
+    WHICH STRATEGIES ARE OUT, owned by PortfolioDetails as rows[].selected.
+
+    Lifted out of this component on purpose: the same state decides what the
+    run-backtest payload carries, so the configuration row's checkbox and the
+    Strategy-wise Report's checkbox below are one checkbox with two faces.
+    Keeping a private Set here let them disagree.
+  */
+  excludedIds,
+  onToggleStrategy,
+  onClose
 }) => {
   const [sortBy, setSortBy] = useState('Entry date');
   const [sortOrder, setSortOrder] = useState('ASC');
   const [currentPage, setCurrentPage] = useState(1);
   const [aggregateByDay, setAggregateByDay] = useState(true); // Checkbox state for daywise vs tradewise
+  const [showFileNameModal, setShowFileNameModal] = useState(false);
+  const [fileName, setFileName] = useState('');
   const tradesPerPage = 10;
 
   if (!results) {
     return null;
   }
 
-  console.log('🔍 [PortfolioBacktestResults] Received results:', results);
+  console.log('[PortfolioBacktestResults] Received results:', results);
 
   // The API response has data at root level, not nested in data property
   const data = results.data || results;
 
-  console.log('📊 [PortfolioBacktestResults] Using data:', data);
-  console.log('📊 [PortfolioBacktestResults] Data keys:', Object.keys(data));
+  console.log('[PortfolioBacktestResults] Using data:', data);
+  console.log('[PortfolioBacktestResults] Data keys:', Object.keys(data));
 
   // Parse aggregate summary data
   const aggregate = data.aggregate || {};
@@ -47,26 +68,163 @@ const PortfolioBacktestResults = ({
   // Parse monthly stats
   const yearlyReturns = aggregate.monthly_state_result || [];
 
-  // Parse strategy-wise data
-  const strategiesData = data.strategies || [];
-  
+ 
+  const portfolioMonthlyStats = {};
+  yearlyReturns.forEach((yearData) => {
+    const raw = yearData.days_of_Max_Drawdown || '';
+    const daysMatch = raw.match(/^(\d+)/);
+    const dateMatch = raw.match(/\[(.*?) to (.*?)\]/);
+    const num = (v) => (v === null || v === undefined || v === '' ? null : parseFloat(v));
+    portfolioMonthlyStats[yearData.year] = {
+      Jan: num(yearData.january), Feb: num(yearData.february), Mar: num(yearData.march),
+      Apr: num(yearData.april),   May: num(yearData.may),      Jun: num(yearData.june),
+      Jul: num(yearData.july),    Aug: num(yearData.august),   Sep: num(yearData.september),
+      Oct: num(yearData.october), Nov: num(yearData.november), Dec: num(yearData.december),
+      total: num(yearData.total) ?? 0,
+      max_drawdown: num(yearData.max_Drawdown),
+      days_for_mdd: daysMatch ? daysMatch[1] : null,
+      mdd_start: dateMatch ? dateMatch[1] : null,
+      mdd_end: dateMatch ? dateMatch[2] : null,
+      r_mdd: num(yearData.yearly_Return_per_MaxDD),
+    };
+  });
+
+  // Parse strategy-wise data.
+
+  const strategyMeta = Array.isArray(data.strategies) ? data.strategies : [];
+  const rootTrades = Array.isArray(data.trade_results) ? data.trade_results : [];
+
+  const strategiesData = (() => {
+    // id -> display name, from the response first, then the portfolio rows.
+    const nameById = new Map();
+    strategyMeta.forEach((m) => {
+      if (m?.strategy_id !== undefined && m?.strategy_id !== null) {
+        nameById.set(String(m.strategy_id), m.strategy_name);
+      }
+    });
+    (Array.isArray(strategies) ? strategies : []).forEach((row) => {
+      const key = String(row?.id ?? '');
+      if (key && !nameById.has(key)) nameById.set(key, row.name);
+    });
+    const metaById = new Map(
+      strategyMeta.map((m) => [String(m.strategy_id), m])
+    );
+
+    if (rootTrades.length > 0) {
+      const byStrategy = new Map();
+      rootTrades.forEach((trade) => {
+        const legsById = new Map();
+        (trade.legs || []).forEach((leg) => {
+          const sid = String(leg.strategy_id ?? 'unknown');
+          if (!legsById.has(sid)) legsById.set(sid, []);
+          legsById.get(sid).push(leg);
+        });
+        legsById.forEach((legs, sid) => {
+          if (!byStrategy.has(sid)) {
+            const meta = metaById.get(sid) || {};
+            byStrategy.set(sid, {
+              strategy_id: sid,
+              strategy_name: meta.strategy_name || nameById.get(sid) || `Strategy ${sid}`,
+              summary_report_result: meta.summary_report_result || [],
+              monthly_state_result: meta.monthly_state_result || [],
+              trade_results: [],
+            });
+          }
+          byStrategy.get(sid).trade_results.push({ trade_date: trade.trade_date, legs });
+        });
+      });
+      // A strategy that reported summaries but traded nothing still deserves its
+      // column in the strategy-wise table.
+      strategyMeta.forEach((m) => {
+        const sid = String(m.strategy_id);
+        if (!byStrategy.has(sid)) {
+          byStrategy.set(sid, { ...m, strategy_id: sid, trade_results: m.trade_results || [] });
+        }
+      });
+      return Array.from(byStrategy.values());
+    }
+
+    return strategyMeta;
+  })();
+  const splitDateTime = (value) => {
+    if (!value || typeof value !== 'string') return { date: '', time: '' };
+    const m = value.trim().match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}(?::\d{2})?)/);
+    if (m) return { date: m[1], time: m[2].length === 5 ? `${m[2]}:00` : m[2] };
+    // Date with no time part at all.
+    const dateOnly = value.trim().match(/^(\d{4}-\d{2}-\d{2})$/);
+    return dateOnly ? { date: dateOnly[1], time: '' } : { date: '', time: '' };
+  };
+
+  // Milliseconds for ordering; legs that never entered sort last instead of
+  // returning NaN and landing at index 0.
+  const stampMs = (value) => {
+    const { date, time } = splitDateTime(value);
+    if (!date) return null;
+    const t = new Date(`${date}T${time || '00:00:00'}`).getTime();
+    return Number.isNaN(t) ? null : t;
+  };
+  const allLegRows = legRows(rootTrades);
+  const everyStrategyId = [...new Set(strategiesData.map((s) => String(s.strategy_id)))];
+  const isTicked = (id) => !(excludedIds?.has(String(id)) ?? false);
+  const tickedIds = everyStrategyId.filter(isTicked);
+  const anyExcluded = tickedIds.length !== everyStrategyId.length;
+  const noneTicked = tickedIds.length === 0;
+  const tickedRows = anyExcluded
+    ? allLegRows.filter((r) => isTicked(r.strategyId))
+    : allLegRows;
+  const recomputed = anyExcluded ? summaryFromRows(tickedRows) : null;
+  const monthlyStatsShown = anyExcluded
+    ? (() => {
+      const recalculated = monthlyFromRows(tickedRows);
+      const out = {};
+      for (const [year, row] of Object.entries(recalculated)) {
+        const original = portfolioMonthlyStats[year];
+        out[year] = original
+          ? {
+            ...row,
+            days_for_mdd: original.days_for_mdd,
+            mdd_start: original.mdd_start,
+            mdd_end: original.mdd_end,
+            r_mdd: original.r_mdd,
+          }
+          : row;
+      }
+      return out;
+    })()
+    : portfolioMonthlyStats;
+
+  /*
+    The table is keyed by NAME (that is what the columns are), while the
+    checkboxes and the filter work on ids. One map, built once, rather than a
+    lookup scan inside the render of every cell.
+  */
+  const idByName = new Map(strategiesData.map((st) => [st.strategy_name, String(st.strategy_id)]));
+  const fadedColumns = new Set(
+    strategiesData.filter((st) => !isTicked(st.strategy_id)).map((st) => st.strategy_name),
+  );
+
+  const toggleStrategy = (id) => onToggleStrategy?.(id);
+
   // Build cumulative P/L data from trades
   const allTradesWithPnL = [];
   strategiesData.forEach(strategy => {
+    // Unticked strategies are left out of the curve, as they are out of the
+    // Aggregate column -- the chart and the figures describe the same set.
+    if (!isTicked(strategy.strategy_id)) return;
     const trades = strategy.trade_results || [];
     trades.forEach(trade => {
       // Calculate trade P/L from legs
       let tradePnL = 0;
       if (trade.legs && trade.legs.length > 0) {
         trade.legs.forEach(leg => {
-          if (leg.pnl !== undefined && leg.pnl !== null && leg.status !== 'NO_CHAIN_DATA') {
+          if (leg.pnl !== undefined && leg.pnl !== null) {
             tradePnL += parseFloat(leg.pnl) || 0;
           }
         });
       }
       
       // Only add trades that have P/L data
-      if (tradePnL !== 0 || (trade.legs && trade.legs.some(leg => leg.status !== 'NO_CHAIN_DATA'))) {
+      if (trade.legs && trade.legs.length > 0) {
         allTradesWithPnL.push({
           date: trade.trade_date || trade.entry_datetime?.split('T')[0],
           pnl: tradePnL,
@@ -104,7 +262,7 @@ const PortfolioBacktestResults = ({
     });
   });
 
-  console.log('📈 [PortfolioBacktestResults] Cumulative data calculated:', {
+  console.log('[PortfolioBacktestResults] Cumulative data calculated:', {
     totalTrades: allTradesWithPnL.length,
     finalCumulativePnL: cumulativePnL,
     dataPoints: cumulativeData.length
@@ -116,6 +274,9 @@ const PortfolioBacktestResults = ({
   const dayTradesMap = {}; // Aggregated by day (daywise)
   
   strategiesData.forEach(strategy => {
+    // Unticked strategies drop out of the Full Report too, so the trade list
+    // and the figures above it always describe the same set.
+    if (!isTicked(strategy.strategy_id)) return;
     const trades = strategy.trade_results || [];
     trades.forEach(trade => {
       const tradeDate = trade.trade_date;
@@ -123,19 +284,22 @@ const PortfolioBacktestResults = ({
       // Process each leg as a separate trade row (tradewise)
       if (trade.legs && trade.legs.length > 0) {
         trade.legs.forEach(leg => {
-          // Only add legs that have actual trade data, not just NO_CHAIN_DATA status
-          if (leg.status !== 'NO_CHAIN_DATA') {
-            // Parse entry/exit datetime
-            const entryDateTime = trade.entry_datetime || '';
-            const exitDateTime = leg.exit_datetime || trade.exit_datetime || '';
-            
-            const [entryDate, entryTime] = entryDateTime.split('T');
-            const entryTimeFormatted = entryTime ? entryTime.split('+')[0].substring(0, 8) : '';
-            
-            const [exitDate, exitTime] = exitDateTime.split('T');
-            const exitTimeFormatted = exitTime ? exitTime.split('+')[0].substring(0, 8) : '';
-            
+          // Every leg from the response is reported here, executed or not —
+          // the portfolio report is deliberately unfiltered (the Strategy
+          // Builder report still hides legs that never entered).
+          {
+            // Entry/exit timestamps live on the LEG, not on the trade. Reading
+            // trade.entry_datetime (which does not exist) blanked every Entry
+            // Time and fell back to the bare trade_date for Entry Date.
+            const entryStamp = leg.entry_datetime || trade.entry_datetime || '';
+            const exitStamp = leg.exit_datetime || trade.exit_datetime || '';
+
+            const { date: entryDate, time: entryTimeFormatted } = splitDateTime(entryStamp);
+            const { date: exitDate, time: exitTimeFormatted } = splitDateTime(exitStamp);
+
             const legData = {
+              entry_stamp: entryStamp,
+              exit_stamp: exitStamp,
               strategy_name: strategy.strategy_name,
               strategy_id: strategy.strategy_id,
               trade_date: trade.trade_date,
@@ -150,8 +314,10 @@ const PortfolioBacktestResults = ({
               qty: leg.quantity_multiplier || leg.quantity || leg.qty || leg.lot_size || '',
               entry_price: leg.entry_price || leg.entryPrice || 0,
               exit_price: leg.exit_price || leg.exitPrice || 0,
-              vix: leg.vix || trade.vix || 0,
               pnl: leg.pnl || leg.profit_loss || 0,
+              // Why the leg closed, same source and precedence the Strategy
+              // Builder export uses for its Remarks column.
+              remarks: leg.exit_reason || leg.status || '',
               moneyness: leg.moneyness || '',
               ticker: leg.ticker || ''
             };
@@ -164,13 +330,14 @@ const PortfolioBacktestResults = ({
                 strategy_name: strategy.strategy_name,
                 strategy_id: strategy.strategy_id,
                 trade_date: tradeDate,
-                entry_date: entryDate || tradeDate,
-                entry_time: entryTimeFormatted,
-                exit_date: exitDate || '',
-                exit_time: exitTimeFormatted,
+                // Filled in below from the legs actually collected for the day,
+                // so one untriggered leg can no longer blank the day's times.
+                entry_date: tradeDate,
+                entry_time: '',
+                exit_date: '',
+                exit_time: '',
                 legs_count: 0,
                 total_pnl: 0,
-                vix: leg.vix || trade.vix || 0,
                 qty: leg.quantity_multiplier || leg.quantity || leg.qty || leg.lot_size || 0,
                 // Collect all strikes, sides, entry prices, exit prices from legs
                 strikes: [],
@@ -198,10 +365,30 @@ const PortfolioBacktestResults = ({
     });
   });
   
-  // Convert daywise map to array
-  const allTradesDaywise = Object.values(dayTradesMap);
+  // Convert daywise map to array, ordering each day's legs chronologically and
+  // taking the day's window from the legs that actually traded: entry = first
+  // leg to enter, exit = last leg to exit.
+  const allTradesDaywise = Object.values(dayTradesMap).map((day) => {
+    const legs = [...day.legs].sort(
+      (a, b) => (stampMs(a.entry_stamp) ?? Infinity) - (stampMs(b.entry_stamp) ?? Infinity)
+    );
+    const firstEntered = legs.find((l) => stampMs(l.entry_stamp) !== null);
+    const lastExited = legs
+      .filter((l) => stampMs(l.exit_stamp) !== null)
+      .sort((a, b) => stampMs(a.exit_stamp) - stampMs(b.exit_stamp))
+      .pop();
+
+    return {
+      ...day,
+      legs,
+      entry_date: firstEntered?.entry_date || day.trade_date,
+      entry_time: firstEntered?.entry_time || '',
+      exit_date: lastExited?.exit_date || '',
+      exit_time: lastExited?.exit_time || '',
+    };
+  });
   
-  console.log('📋 [PortfolioBacktestResults] Trade data built:', {
+  console.log('[PortfolioBacktestResults] Trade data built:', {
     legwiseTrades: allTradesLegwise.length,
     daywiseTrades: allTradesDaywise.length,
     sampleLegwise: allTradesLegwise[0],
@@ -238,10 +425,12 @@ const PortfolioBacktestResults = ({
   });
   
   // Pagination logic
-  const indexOfLastTrade = currentPage * tradesPerPage;
+  const totalPages = Math.ceil(sortedTrades.length / tradesPerPage);
+  const safePage = Math.min(Math.max(1, currentPage), Math.max(totalPages, 1));
+
+  const indexOfLastTrade = safePage * tradesPerPage;
   const indexOfFirstTrade = indexOfLastTrade - tradesPerPage;
   const currentTrades = sortedTrades.slice(indexOfFirstTrade, indexOfLastTrade);
-  const totalPages = Math.ceil(sortedTrades.length / tradesPerPage);
 
   const formatCurrency = (value) => {
     const num = parseFloat(value) || 0;
@@ -251,6 +440,177 @@ const PortfolioBacktestResults = ({
   const formatNumber = (value, decimals = 2) => {
     const num = parseFloat(value) || 0;
     return num.toLocaleString('en-IN', { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+  };
+
+  // CSV wants plain numbers — formatNumber's en-IN grouping would put commas
+  // inside a field and break the column on import.
+  const csvNumber = (value, decimals = 2) => {
+    if (value === undefined || value === null || value === '') return '';
+    const num = parseFloat(value);
+    return Number.isNaN(num) ? '' : num.toFixed(decimals);
+  };
+
+  const defaultReportName = `trade_${portfolioName || 'portfolio'}`;
+  const saveCsv = (csv, filename) => {
+    const blob = new Blob(['\ufeff', csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.rel = 'noopener';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { a.remove(); URL.revokeObjectURL(url); }, 1000);
+  };
+
+  const downloadStrategyTrades = (strategyId, strategyName) => {
+    const key = String(strategyId);
+
+    // "2025-10-28" -> "Tuesday". Built from the date alone so a timestamp's
+    // timezone cannot roll it to the day before.
+    const weekday = (date) => {
+      if (!date) return '';
+      const d = new Date(`${date}T12:00:00`);
+      return Number.isNaN(d.getTime()) ? '' : d.toLocaleDateString('en-US', { weekday: 'long' });
+    };
+
+    // The first of several spellings the backend has used for a field.
+    const pick = (obj, names) => {
+      for (const n of names) {
+        const v = obj?.[n];
+        if (v !== undefined && v !== null && v !== '') return v;
+      }
+      return '';
+    };
+
+    /*
+      Percentage move on the leg's own premium, signed the way the position
+      profits: a Sell gains when the price falls. Computed rather than read,
+      because the response does not carry it.
+    */
+    const plPercent = (leg) => {
+      const entry = parseFloat(leg?.entry_price);
+      const exit = parseFloat(leg?.exit_price);
+      if (!Number.isFinite(entry) || !Number.isFinite(exit) || entry === 0) return '';
+      const sell = String(leg?.position ?? '').toUpperCase().startsWith('S');
+      return ((sell ? entry - exit : exit - entry) / entry) * 100;
+    };
+
+    const header = ['Index', 'Entry-Date', 'Entry-Weekday', 'Entry-Time', 'Entry-Price',
+      'Entry-Delta', 'Quantity', 'Instrument-Kind', 'StrikePrice', 'Position',
+      'ExitDate', 'Exit-Weekday', 'ExitTime', 'ExitPrice', 'Exit-Delta',
+      'P/L', 'P/L-Percentage', 'ExpiryDate', 'Remarks'];
+    const rows = [header];
+
+    let n = 0;
+    rootTrades.forEach((trade) => {
+      const legs = (trade.legs || []).filter((l) => String(l.strategy_id ?? '') === key);
+      if (!legs.length) return;
+      n += 1;
+
+      // The trade's own span: earliest entry to latest exit across its legs.
+      const first = legs[0];
+      const last = legs[legs.length - 1];
+      const pEntry = splitDateTime(first?.entry_datetime);
+      const pExit = splitDateTime(last?.exit_datetime);
+      const totalPnl = legs.reduce((sum, l) => sum + (parseFloat(l?.pnl) || 0), 0);
+
+      rows.push([
+        String(n),
+        pEntry.date, '', pEntry.time,
+        pick(first, ['underlying_entry_price']),
+        '', '', '', '', '',
+        pExit.date, '', pExit.time,
+        pick(last, ['underlying_exit_price']),
+        '',
+        totalPnl, '', '',
+        pick(last, ['exit_reason']) || pick(first, ['entry_reason']),
+      ]);
+
+      legs.forEach((leg, i) => {
+        const entry = splitDateTime(leg.entry_datetime);
+        const exit = splitDateTime(leg.exit_datetime);
+        rows.push([
+          `${n}.${i + 1}`,
+          entry.date, weekday(entry.date), entry.time,
+          pick(leg, ['entry_price']),
+          pick(leg, ['entry_delta', 'delta_entry']),
+          pick(leg, ['quantity', 'qty', 'lot_size']),
+          pick(leg, ['option', 'type']),
+          pick(leg, ['strike']),
+          pick(leg, ['position', 'side']),
+          exit.date, weekday(exit.date), exit.time,
+          pick(leg, ['exit_price']),
+          pick(leg, ['exit_delta', 'delta_exit']),
+          pick(leg, ['pnl']),
+          plPercent(leg),
+          pick(leg, ['expiration_date', 'expiry_date']),
+          pick(leg, ['exit_reason']) || pick(leg, ['entry_reason']),
+        ]);
+      });
+    });
+
+    const csv = rows
+      .map((r) => r.map((c) => `"${String(c ?? '').replace(/"/g, '""')}"`).join(','))
+      .join('\n');
+
+    const safe = String(strategyName || 'strategy').replace(/[\\/:*?"<>|]/g, '_');
+    saveCsv(csv, `${safe}.csv`);
+  };
+
+  const buildTradesCsv = () => {
+    const header = ['Index', 'Entry Date', 'Entry Time', 'Exit Date', 'Exit Time', 'Type',
+                    'Strike', 'B/S', 'Qty', 'Entry Price', 'Exit Price', 'P/L', 'Remarks'];
+    const rows = [header];
+
+    sortedTrades.forEach((trade, idx) => {
+      const n = idx + 1;
+      if (aggregateByDay) {
+        // Remarks is a per-leg exit reason, so the day summary row leaves it
+        // blank — the same way the Strategy Builder export does.
+        rows.push([
+          n, trade.entry_date || '', trade.entry_time || '', trade.exit_date || '', trade.exit_time || '',
+          '', '', '', '', '', '', csvNumber(trade.total_pnl), '',
+        ]);
+        (trade.legs || []).forEach((leg, legIdx) => {
+          rows.push([
+            `${n}.${legIdx + 1}`, leg.entry_date || '', leg.entry_time || '', leg.exit_date || '', leg.exit_time || '',
+            (leg.type || '').toUpperCase(), leg.strike ?? '', leg.side || '', leg.qty ?? '',
+            csvNumber(leg.entry_price), csvNumber(leg.exit_price), csvNumber(leg.pnl), leg.remarks || '',
+          ]);
+        });
+      } else {
+        rows.push([
+          n, trade.entry_date || '', trade.entry_time || '', trade.exit_date || '', trade.exit_time || '',
+          (trade.type || '').toUpperCase(), trade.strike ?? '', trade.side || '', trade.qty ?? '',
+          csvNumber(trade.entry_price), csvNumber(trade.exit_price), csvNumber(trade.pnl), trade.remarks || '',
+        ]);
+      }
+    });
+
+    // Every field quoted, embedded quotes doubled. Leading BOM so Excel opens
+    // the file as UTF-8 instead of mangling the rupee sign and names.
+    const body = rows
+      .map((r) => r.map((cell) => `"${String(cell ?? '').replace(/"/g, '""')}"`).join(','))
+      .join('\n');
+    return `\ufeff${body}`;
+  };
+
+  const downloadTradesCsv = () => {
+    // Empty input means "use the default", matching the placeholder shown.
+    const typed = fileName.trim();
+    const safe = (typed || defaultReportName).replace(/[\\/:*?"<>|]/g, '_');
+    const blob = new Blob([buildTradesCsv()], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = safe.toLowerCase().endsWith('.csv') ? safe : `${safe}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    setShowFileNameModal(false);
+    setFileName('');
   };
 
   // Build strategy stats object for table
@@ -355,9 +715,19 @@ const PortfolioBacktestResults = ({
     };
   }
 
-  const strategyNames = Object.keys(strategyStats);
+  /*
+    THE AGGREGATE COLUMN. Replaced with the recomputation whenever a strategy
+    is unticked -- the block assigned above came from the response and always
+    describes all of them.
+  */
+  if (recomputed) strategyStats[aggregateLabel] = recomputed;
 
-  console.log('📊 [PortfolioBacktestResults] Final data:', {
+  const strategyNames = [
+    ...Object.keys(strategyStats).filter((name) => name === aggregateLabel),
+    ...Object.keys(strategyStats).filter((name) => name !== aggregateLabel),
+  ];
+
+  console.log('[PortfolioBacktestResults] Final data:', {
     yearlyReturns: yearlyReturns.length,
     strategyNames: strategyNames.length,
     allTrades: allTrades.length,
@@ -370,7 +740,7 @@ const PortfolioBacktestResults = ({
       {/* Show message if no trade data */}
       {allTrades.length === 0 && (
         <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-6">
-          <h3 className="text-lg font-semibold text-yellow-800 mb-2">⚠️ No Trade Data Available</h3>
+          <h3 className="text-lg font-semibold text-yellow-800 mb-2">No Trade Data Available</h3>
           <p className="text-yellow-700">
             The backtest completed but no trades were executed. This usually means:
           </p>
@@ -388,28 +758,20 @@ const PortfolioBacktestResults = ({
         </div>
       )}
 
-      {/* BACKTEST RESULT Header */}
+      {/* BACKTEST RESULT Header.
+
+          SHOWN EVEN WITH NOTHING TICKED, with empty axes. The reference keeps
+          the chart frame standing and empties it, which reads as "no strategy
+          selected"; removing the card instead makes the page jump and looks
+          like the backtest itself failed. */}
       <div className="bg-white rounded-lg border border-gray-200 p-6">
         <div className="flex items-start justify-between mb-4">
           <div>
-            <h2 className="text-xl font-bold text-gray-900 mb-2">BACKTEST RESULT</h2>
+            <h2 className="text-lg font-bold text-gray-900 mb-2">Bcktest Result</h2>
             <div className="flex items-center gap-2 mb-2 ignore-pdf">
-              <input type="checkbox" id="include-previous" className="w-4 h-4" />
-              <label htmlFor="include-previous" className="text-sm text-gray-600">
-                Include data from previous regime
-              </label>
             </div>
-            <p className="text-xs text-orange-600 ignore-pdf">
-              Following results are backtested results on historical data. These historical simulations do not represent actual trading and have not been executed in the live market. <button className="text-blue-600 hover:underline">Know more</button>
-            </p>
           </div>
-          <div className="flex items-center gap-3">
-            <button className="px-4 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50">
-              📷 Snap a Screenshot
-            </button>
-            <button className="px-4 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50">
-              🔄 Reset Zoom
-            </button>
+          <div className="flex items-center gap-3">   
           </div>
         </div>
 
@@ -420,9 +782,6 @@ const PortfolioBacktestResults = ({
               <span className="w-3 h-3 bg-green-500 rounded-full"></span>
               <span className="text-sm font-medium">Cumulative P/L</span>
             </div>
-            <button className="px-3 py-1 border border-gray-300 rounded text-sm hover:bg-gray-50">
-              Reset Zoom
-            </button>
           </div>
           <div className="h-80">
             <ResponsiveContainer width="100%" height="100%">
@@ -466,9 +825,6 @@ const PortfolioBacktestResults = ({
               <span className="w-3 h-3 bg-red-500 rounded-full"></span>
               <span className="text-sm font-medium">Drawdown</span>
             </div>
-            <button className="px-3 py-1 border border-gray-300 rounded text-sm hover:bg-gray-50">
-              Reset Zoom
-            </button>
           </div>
           <div className="h-64">
             <ResponsiveContainer width="100%" height="100%">
@@ -506,83 +862,18 @@ const PortfolioBacktestResults = ({
         </div>
       </div>
 
-      {/* Year-wise Returns Table */}
-      <div className="bg-white rounded-lg border border-gray-200 p-6">
-        <h3 className="text-lg font-bold text-gray-900 mb-4">Year-wise Returns</h3>
-        <div className="overflow-x-auto">
-          <table className="min-w-full text-sm">
-            <thead className="bg-gray-50">
-              <tr>
-                <th className="px-4 py-2 text-left font-medium text-gray-600">Year</th>
-                {['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'].map(month => (
-                  <th key={month} className="px-4 py-2 text-right font-medium text-gray-600">{month}</th>
-                ))}
-                <th className="px-4 py-2 text-right font-medium text-gray-600">Total</th>
-                <th className="px-4 py-2 text-right font-medium text-gray-600">Max Drawdown</th>
-                <th className="px-4 py-2 text-right font-medium text-gray-600">Days for MDD</th>
-                <th className="px-4 py-2 text-right font-medium text-gray-600">%MDD (Yearly)</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-gray-200">
-              {yearlyReturns.map((yearData, idx) => {
-                const year = yearData.year || yearData.period || `Year ${idx + 1}`;
-                // Backend uses full month names: january, february, etc.
-                const monthKeys = ['january', 'february', 'march', 'april', 'may', 'june', 
-                                   'july', 'august', 'september', 'october', 'november', 'december'];
-                const monthAbbr = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-                
-                return (
-                  <tr key={year} className="hover:bg-gray-50">
-                    <td className="px-4 py-2 font-medium text-gray-900">{year}</td>
-                    {monthKeys.map((monthKey, mIdx) => {
-                      const value = yearData[monthKey];
-                      const numValue = value === null || value === undefined ? null : parseFloat(value);
-                      return (
-                        <td 
-                          key={monthKey} 
-                          className={`px-4 py-2 text-right ${
-                            numValue === null ? 'text-gray-400' : 
-                            numValue >= 0 ? 'text-green-600' : 'text-red-600'
-                          }`}
-                        >
-                          {numValue === null ? '-' : formatNumber(numValue, 0)}
-                        </td>
-                      );
-                    })}
-                    <td className={`px-4 py-2 text-right font-semibold ${
-                      parseFloat(yearData.total || 0) >= 0 ? 'text-green-600' : 'text-red-600'
-                    }`}>
-                      {formatNumber(yearData.total || 0, 0)}
-                    </td>
-                    <td className="px-4 py-2 text-right text-red-600">
-                      {formatNumber(yearData.max_Drawdown || yearData.maxDrawdown || 0, 0)}
-                    </td>
-                    <td className="px-4 py-2 text-right text-gray-700 text-xs">
-                      {yearData.days_of_Max_Drawdown || yearData.mddDays || '-'}
-                    </td>
-                    <td className="px-4 py-2 text-right text-gray-700">
-                      {formatNumber(yearData.yearly_Return_per_MaxDD || yearData.mddPercent || 0, 2)}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      {/* Curve Fitting Analysis */}
-      <div className="bg-white rounded-lg border border-gray-200 p-6">
-        <div className="flex items-center justify-between mb-4">
-          <h3 className="text-lg font-bold text-gray-900">Curve Fitting Analysis: Monte Carlo Drawdown</h3>
-          <button className="px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">
-            Run 10000 Simulations
-          </button>
-        </div>
-        <div className="flex items-center gap-4">
-          <input type="range" min="1" max="99" defaultValue="1" className="flex-1" />
-          <span className="text-2xl font-bold text-gray-900">99</span>
-        </div>
+      {/* Year-wise Returns — the SAME component the Strategy Builder renders.
+          This used to be a second, hand-written table with its own padding,
+          header shade and number formatting, so the two pages disagreed and the
+          portfolio one rendered differently again on other machines. One
+          component means one appearance everywhere. */}
+      {/* `emptyAsTable`: with nothing ticked this keeps the column headings
+          and drops the rows, as the reference does, rather than replacing the
+          whole table with a sentence. */}
+      <div className="bg-white rounded-lg border border-gray-200">
+        <MonthlyStatsTable monthlyStats={monthlyStatsShown}
+                          headingClass="text-lg font-bold"
+                          emptyAsTable />
       </div>
 
       {/* Brokerage, Taxes & Analysis */}
@@ -609,7 +900,12 @@ const PortfolioBacktestResults = ({
               <input type="number" placeholder="From" defaultValue="0" className="w-full px-3 py-2 border border-gray-300 rounded" />
               <span>To</span>
               <input type="number" placeholder="To" defaultValue="150" className="w-full px-3 py-2 border border-gray-300 rounded" />
-              <button className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 whitespace-nowrap">
+              <button
+                className="px-4 py-2 text-white rounded whitespace-nowrap transition-colors"
+                style={{ backgroundColor: colors.legBuilder.addLegBg }}
+                onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = colors.legBuilder.addLegHoverBg; }}
+                onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = colors.legBuilder.addLegBg; }}
+              >
                 Re-calculate
               </button>
             </div>
@@ -637,21 +933,56 @@ const PortfolioBacktestResults = ({
         
         <div className="overflow-x-auto">
           <table className="min-w-full text-sm">
-            <thead className="bg-gray-50">
+            {/* The Strategy-wise Report is a LIGHT table, unlike the Full Report
+                above: a pale grey surface with white rules between the rows, and
+                centred headings in the same ink as the labels. It briefly wore
+                the Full Report's #E3E3E3 band, which is from a different screen
+                and read far too heavy here. */}
+            <thead>
               <tr>
-                <th className="px-4 py-3 text-left font-medium text-gray-600">Statistic</th>
-                {strategyNames.map(strategy => (
-                  <th key={strategy} className="px-4 py-3 text-right font-medium text-gray-600">
-                    {strategy}
-                  </th>
-                ))}
+                <th className="px-4 py-3 text-center text-[14px] font-semibold"
+                    style={{ backgroundColor: '#F8F8F8', color: '#2A2A2A' }}>Statistic</th>
+                {strategyNames.map(strategy => {
+                  /*
+                    The Aggregate column has no box of its own -- it IS the
+                    result of the boxes, and ticking it would mean nothing.
+                  */
+                  const id = idByName.get(strategy);
+                  const ticked = id === undefined ? true : isTicked(id);
+                  return (
+                    <th key={strategy} className="px-4 py-3 text-center text-[14px] font-semibold"
+                        style={{ backgroundColor: '#F8F8F8', color: ticked ? '#2A2A2A' : '#A1A1AA' }}>
+                      {id !== undefined && (
+                        <div className="flex justify-center mb-1">
+                          <input
+                            type="checkbox"
+                            checked={ticked}
+                            onChange={() => toggleStrategy(id)}
+                            aria-label={`Include ${strategy} in the portfolio figures`}
+                            className="w-4 h-4 text-blue-600 rounded focus:ring-blue-500 cursor-pointer"
+                          />
+                        </div>
+                      )}
+                      {strategy}
+                    </th>
+                  );
+                })}
               </tr>
             </thead>
-            <tbody className="divide-y divide-gray-200">
+            <tbody className="divide-y-2 divide-white">
+              {/*
+                THE STATISTICS DISAPPEAR WHEN NOTHING IS TICKED. Every figure
+                here describes the ticked strategies, so with none of them
+                ticked each row would read as a column of zeroes -- a result
+                that did not happen. The Download Trades row below stays, so a
+                strategy can still be exported without being counted.
+              */}
+              {!noneTicked && (<>
               <StatisticRow 
                 label="Overall Profit" 
                 strategies={strategyNames} 
                 data={strategyStats}
+                fadedColumns={fadedColumns}
                 field="overall_profit"
                 isCurrency 
               />
@@ -659,12 +990,14 @@ const PortfolioBacktestResults = ({
                 label={aggregateByDay ? "No. of Trades(Periods)" : "No. of Trades"} 
                 strategies={strategyNames} 
                 data={strategyStats}
+                fadedColumns={fadedColumns}
                 field="num_trades"
               />
               <StatisticRow 
                 label={aggregateByDay ? "Average Profit per Period" : "Average Profit per Trade"} 
                 strategies={strategyNames} 
                 data={strategyStats}
+                fadedColumns={fadedColumns}
                 field="avg_profit"
                 isCurrency 
               />
@@ -672,18 +1005,21 @@ const PortfolioBacktestResults = ({
                 label={aggregateByDay ? "Win %(Periods)" : "Win %"} 
                 strategies={strategyNames} 
                 data={strategyStats}
+                fadedColumns={fadedColumns}
                 field="win_rate"
               />
               <StatisticRow 
                 label={aggregateByDay ? "Loss %(Periods)" : "Loss %"} 
                 strategies={strategyNames} 
                 data={strategyStats}
+                fadedColumns={fadedColumns}
                 field="loss_rate"
               />
               <StatisticRow 
                 label={aggregateByDay ? "Average Profit on Winning Periods" : "Average Profit on Winning Trades"} 
                 strategies={strategyNames} 
                 data={strategyStats}
+                fadedColumns={fadedColumns}
                 field="avg_win"
                 isCurrency 
               />
@@ -691,6 +1027,7 @@ const PortfolioBacktestResults = ({
                 label={aggregateByDay ? "Average Loss on Losing Periods" : "Average Loss on Losing Trades"} 
                 strategies={strategyNames} 
                 data={strategyStats}
+                fadedColumns={fadedColumns}
                 field="avg_loss"
                 isCurrency 
               />
@@ -698,6 +1035,7 @@ const PortfolioBacktestResults = ({
                 label={aggregateByDay ? "Max Profit in Single Period" : "Max Profit in Single Trade"} 
                 strategies={strategyNames} 
                 data={strategyStats}
+                fadedColumns={fadedColumns}
                 field="max_profit"
                 isCurrency 
               />
@@ -705,6 +1043,7 @@ const PortfolioBacktestResults = ({
                 label={aggregateByDay ? "Max Loss in Single Period" : "Max Loss in Single Trade"} 
                 strategies={strategyNames} 
                 data={strategyStats}
+                fadedColumns={fadedColumns}
                 field="max_loss"
                 isCurrency 
               />
@@ -712,6 +1051,7 @@ const PortfolioBacktestResults = ({
                 label="Max Drawdown" 
                 strategies={strategyNames} 
                 data={strategyStats}
+                fadedColumns={fadedColumns}
                 field="max_drawdown"
                 isCurrency 
               />
@@ -719,59 +1059,135 @@ const PortfolioBacktestResults = ({
                 label="Duration of Max Drawdown" 
                 strategies={strategyNames} 
                 data={strategyStats}
+                fadedColumns={fadedColumns}
                 field="mdd_duration"
               />
               <StatisticRow 
                 label="Return/MaxDD" 
                 strategies={strategyNames} 
                 data={strategyStats}
+                fadedColumns={fadedColumns}
                 field="return_mdd"
               />
               <StatisticRow 
                 label="Reward to Risk Ratio" 
                 strategies={strategyNames} 
                 data={strategyStats}
+                fadedColumns={fadedColumns}
                 field="reward_risk"
               />
               <StatisticRow 
                 label="Expectancy Ratio" 
                 strategies={strategyNames} 
                 data={strategyStats}
+                fadedColumns={fadedColumns}
                 field="expectancy"
               />
               <StatisticRow 
                 label="Max Win Streak (Periods)" 
                 strategies={strategyNames} 
                 data={strategyStats}
+                fadedColumns={fadedColumns}
                 field="max_win_streak"
               />
               <StatisticRow 
                 label="Max Losing Streak (Periods)" 
                 strategies={strategyNames} 
                 data={strategyStats}
+                fadedColumns={fadedColumns}
                 field="max_loss_streak"
               />
               <StatisticRow 
                 label="Max days in any drawdown(Periods)" 
                 strategies={strategyNames} 
                 data={strategyStats}
+                fadedColumns={fadedColumns}
                 field="max_dd_days"
               />
+              </>)}
+
+              {anyExcluded && (
+              <tr style={{ backgroundColor: '#F8F8F8' }}>
+                <td className="px-4 py-3 text-left font-semibold text-[14px]" style={{ color: '#2A2A2A' }}>
+                  Download Trades
+                </td>
+                {strategyNames.map((strategy) => {
+                  const id = idByName.get(strategy);
+                  // Aggregate has no file of its own -- it is a summary, not a
+                  // strategy -- and a ticked strategy does not offer one here.
+                  if (id === undefined || isTicked(id)) {
+                    return (
+                      <td key={strategy} className="px-4 py-3 text-center text-[12px]"
+                          style={{ color: '#A1A1AA' }}>{id === undefined ? '-' : ''}</td>
+                    );
+                  }
+                  return (
+                    <td key={strategy} className="px-4 py-3 text-center">
+                      <button
+                        type="button"
+                        onClick={() => downloadStrategyTrades(id, strategy)}
+                        title={`Download ${strategy} trades as CSV`}
+                        aria-label={`Download ${strategy} trades as CSV`}
+                        className="inline-flex items-center justify-center text-gray-500 hover:text-gray-800 transition-colors"
+                      >
+                        <Download size={16} />
+                      </button>
+                    </td>
+                  );
+                })}
+              </tr>
+              )}
             </tbody>
           </table>
         </div>
       </div>
 
-      {/* Correlation Matrix */}
-      <div className="bg-white rounded-lg border border-gray-200 p-6">
-        <h3 className="text-lg font-bold text-gray-900 mb-2">Correlation Matrix</h3>
-        <p className="text-sm text-gray-600 mb-4">
-          Identify strategy correlations to optimize diversification and manage portfolio risk.
-        </p>
-        <button className="px-4 py-2 border border-gray-300 rounded text-sm hover:bg-gray-50">
-          Load
-        </button>
-      </div>
+      {showFileNameModal && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[100] p-4">
+          <div className="bg-white rounded-lg shadow-2xl w-full max-w-sm">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200">
+              <h3 className="text-[16px] font-semibold text-gray-800">Enter file name</h3>
+              <button
+                type="button"
+                onClick={() => setShowFileNameModal(false)}
+                className="text-gray-400 hover:text-gray-600"
+                title="Close"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="px-6 py-5">
+              <label className="block text-[13px] text-gray-600 mb-2" htmlFor="trades-file-name">
+                File Name:
+              </label>
+              <input
+                id="trades-file-name"
+                autoFocus
+                value={fileName}
+                onChange={(e) => setFileName(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') downloadTradesCsv(); }}
+                placeholder={defaultReportName}
+                className="w-full px-3 h-10 border rounded-md text-[13px] outline-none focus:ring-2 focus:ring-blue-200"
+                style={{ borderColor: '#e3e3e3', color: '#3a3a3a' }}
+              />
+            </div>
+
+            <div className="flex justify-end px-6 pb-5">
+              <button
+                type="button"
+                onClick={downloadTradesCsv}
+                className="px-5 py-2 rounded-md text-white text-[13px] font-medium transition-colors"
+                style={{ backgroundColor: colors.legBuilder.addLegBg }}
+                onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = colors.legBuilder.addLegHoverBg; }}
+                onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = colors.legBuilder.addLegBg; }}
+              >
+                Download
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Full Report - Only show if there are actual trades with data */}
       {allTrades.length > 0 && (
@@ -779,37 +1195,42 @@ const PortfolioBacktestResults = ({
         <div className="flex items-center justify-between mb-4">
           <h3 className="text-lg font-bold text-gray-900">Full Report</h3>
           <div className="flex items-center gap-3">
-            <label className="text-sm text-gray-600">Sort By:</label>
-            <select 
+            <span className="text-[13px] font-normal mr-1" style={{ color: colors.settingsPanel.label }}>Sort By :</span>
+            <select
               value={sortBy}
               onChange={(e) => setSortBy(e.target.value)}
-              className="px-3 py-1 border border-gray-300 rounded text-sm"
+              className="appearance-none pl-3 pr-8 py-1.5 border rounded-md text-[13px] font-normal outline-none cursor-pointer bg-white"
+              style={{
+                borderColor: colors.settingsPanel.fieldBorder,
+                color: colors.settingsPanel.inputValue,
+                backgroundImage: selectChevron('%234B5563'),
+                backgroundRepeat: 'no-repeat',
+                backgroundPosition: 'right 0.6rem center',
+              }}
             >
               <option>Entry date</option>
-              <option>Exit date</option>
-              <option>Exit time</option>
               <option>P/L</option>
             </select>
-            <button 
-              onClick={() => setSortOrder('ASC')}
-              className={`px-3 py-1 rounded text-sm ${
-                sortOrder === 'ASC' 
-                  ? 'bg-blue-600 text-white' 
-                  : 'border border-gray-300 hover:bg-gray-50'
-              }`}
-            >
-              Asc
-            </button>
-            <button 
-              onClick={() => setSortOrder('DESC')}
-              className={`px-3 py-1 rounded text-sm ${
-                sortOrder === 'DESC' 
-                  ? 'bg-blue-600 text-white' 
-                  : 'border border-gray-300 hover:bg-gray-50'
-              }`}
-            >
-              Desc
-            </button>
+            <div className="inline-flex rounded-md overflow-hidden border" style={{ borderColor: colors.settingsPanel.fieldBorder }}>
+              <button
+                onClick={() => setSortOrder('ASC')}
+                className="px-3.5 py-1.5 text-[13px] transition-colors"
+                style={sortOrder === 'ASC'
+                  ? { backgroundColor: colors.settingsPanel.activeBg, color: colors.settingsPanel.activeText, fontWeight: 500 }
+                  : { backgroundColor: '#FFFFFF', color: colors.settingsPanel.inactiveText }}
+              >
+                Asc
+              </button>
+              <button
+                onClick={() => setSortOrder('DESC')}
+                className="px-3.5 py-1.5 text-[13px] border-l transition-colors"
+                style={sortOrder === 'DESC'
+                  ? { backgroundColor: colors.settingsPanel.activeBg, color: colors.settingsPanel.activeText, fontWeight: 500, borderColor: colors.settingsPanel.fieldBorder }
+                  : { backgroundColor: '#FFFFFF', color: colors.settingsPanel.inactiveText, borderColor: colors.settingsPanel.fieldBorder }}
+              >
+                Desc
+              </button>
+            </div>
             <span className="text-sm text-gray-600">
               Showing {indexOfFirstTrade + 1} - {Math.min(indexOfLastTrade, sortedTrades.length)} trades out of {sortedTrades.length}
             </span>
@@ -818,21 +1239,20 @@ const PortfolioBacktestResults = ({
 
         <div className="overflow-x-auto">
           <table className="min-w-full text-sm">
-            <thead className="bg-gray-50">
+            <thead style={{ backgroundColor: '#E3E3E3' }}>
               <tr>
-                <th className="px-4 py-3 text-left font-medium text-gray-600">Index</th>
-                <th className="px-4 py-3 text-left font-medium text-gray-600">Entry Date</th>
-                <th className="px-4 py-3 text-left font-medium text-gray-600">Entry Time</th>
-                <th className="px-4 py-3 text-left font-medium text-gray-600">Exit Date</th>
-                <th className="px-4 py-3 text-left font-medium text-gray-600">Exit Time</th>
-                <th className="px-4 py-3 text-left font-medium text-gray-600">Type</th>
-                <th className="px-4 py-3 text-right font-medium text-gray-600">Strike</th>
-                <th className="px-4 py-3 text-left font-medium text-gray-600">B/S</th>
-                <th className="px-4 py-3 text-right font-medium text-gray-600">Qty</th>
-                <th className="px-4 py-3 text-right font-medium text-gray-600">Entry Price</th>
-                <th className="px-4 py-3 text-right font-medium text-gray-600">Exit Price</th>
-                <th className="px-4 py-3 text-right font-medium text-gray-600">Vix</th>
-                <th className="px-4 py-3 text-right font-medium text-gray-600">P/L</th>
+                <th className="px-1 py-1 text-center text-[14px] font-bold whitespace-nowrap border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>Index</th>
+                <th className="px-1 py-1 text-center text-[14px] font-bold whitespace-nowrap border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>Entry Date</th>
+                <th className="px-1 py-1 text-center text-[14px] font-bold whitespace-nowrap border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>Entry Time</th>
+                <th className="px-1 py-1 text-center text-[14px] font-bold whitespace-nowrap border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>Exit Date</th>
+                <th className="px-1 py-1 text-center text-[14px] font-bold whitespace-nowrap border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>Exit Time</th>
+                <th className="px-1 py-1 text-center text-[14px] font-bold whitespace-nowrap border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>Type</th>
+                <th className="px-1 py-1 text-center text-[14px] font-bold whitespace-nowrap border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>Strike</th>
+                <th className="px-1 py-1 text-center text-[14px] font-bold whitespace-nowrap border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>B/S</th>
+                <th className="px-1 py-1 text-center text-[14px] font-bold whitespace-nowrap border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>Qty</th>
+                <th className="px-1 py-1 text-center text-[14px] font-bold whitespace-nowrap border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>Entry Price</th>
+                <th className="px-1 py-1 text-center text-[14px] font-bold whitespace-nowrap border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>Exit Price</th>
+                <th className="px-1 py-1 text-center text-[14px] font-bold whitespace-nowrap border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>P/L</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-200">
@@ -842,22 +1262,21 @@ const PortfolioBacktestResults = ({
                   const pnl = parseFloat(trade.total_pnl || 0);
                   const rows = [];
                   
-                  // Parent row for the day (aggregated summary)
                   rows.push(
-                    <tr key={`${indexOfFirstTrade + idx}-parent`} className="hover:bg-gray-50 bg-gray-50 font-medium">
-                      <td className="px-4 py-3 text-gray-900">{indexOfFirstTrade + idx + 1}</td>
-                      <td className="px-4 py-3 text-gray-900">{trade.entry_date || '-'}</td>
-                      <td className="px-4 py-3 text-gray-900">{trade.entry_time || '-'}</td>
-                      <td className="px-4 py-3 text-gray-900">{trade.exit_date || '-'}</td>
-                      <td className="px-4 py-3 text-gray-900">{trade.exit_time || '-'}</td>
-                      <td className="px-4 py-3 text-gray-900">-</td>
-                      <td className="px-4 py-3 text-right text-gray-900">-</td>
-                      <td className="px-4 py-3 text-gray-900">-</td>
-                      <td className="px-4 py-3 text-right text-gray-900">-</td>
-                      <td className="px-4 py-3 text-right text-gray-900">-</td>
-                      <td className="px-4 py-3 text-right text-gray-900">-</td>
-                      <td className="px-4 py-3 text-right text-gray-900">{formatNumber(trade.vix, 2)}</td>
-                      <td className={`px-4 py-3 text-right font-semibold ${pnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                    <tr key={`${indexOfFirstTrade + idx}-parent`} className="hover:bg-gray-50 font-medium">
+                      {/* Index column carries the header band's grey, as the builder draws it. */}
+                      <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A', backgroundColor: '#E3E3E3' }}>{indexOfFirstTrade + idx + 1}</td>
+                      <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>{trade.entry_date || '-'}</td>
+                      <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>{trade.entry_time || '-'}</td>
+                      <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>{trade.exit_date || '-'}</td>
+                      <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>{trade.exit_time || '-'}</td>
+                      <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}></td>
+                      <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}></td>
+                      <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}></td>
+                      <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}></td>
+                      <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}></td>
+                      <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}></td>
+                      <td className={`p-1 text-center text-[14px] font-medium border-2 ${pnl >= 0 ? 'text-green-600' : 'text-red-600'}`} style={{ borderColor: '#D4D4D8' }}>
                         {formatNumber(pnl, 2)}
                       </td>
                     </tr>
@@ -868,19 +1287,20 @@ const PortfolioBacktestResults = ({
                     const legPnl = parseFloat(leg.pnl || 0);
                     rows.push(
                       <tr key={`${indexOfFirstTrade + idx}-leg-${legIdx}`} className="hover:bg-gray-50">
-                        <td className="px-4 py-3 text-gray-700 text-sm pl-8">{indexOfFirstTrade + idx + 1}.{legIdx + 1}</td>
-                        <td className="px-4 py-3 text-gray-700 text-sm">{leg.entry_date || '-'}</td>
-                        <td className="px-4 py-3 text-gray-700 text-sm">{leg.entry_time || '-'}</td>
-                        <td className="px-4 py-3 text-gray-700 text-sm">{leg.exit_date || '-'}</td>
-                        <td className="px-4 py-3 text-gray-700 text-sm">{leg.exit_time || '-'}</td>
-                        <td className="px-4 py-3 text-gray-700 text-sm uppercase">{leg.type || '-'}</td>
-                        <td className="px-4 py-3 text-right text-gray-700 text-sm">{leg.strike || '-'}</td>
-                        <td className="px-4 py-3 text-gray-700 text-sm">{leg.side || '-'}</td>
-                        <td className="px-4 py-3 text-right text-gray-700 text-sm">{leg.qty || '-'}</td>
-                        <td className="px-4 py-3 text-right text-gray-700 text-sm">{formatNumber(leg.entry_price, 2)}</td>
-                        <td className="px-4 py-3 text-right text-gray-700 text-sm">{formatNumber(leg.exit_price, 2)}</td>
-                        <td className="px-4 py-3 text-right text-gray-700 text-sm">{formatNumber(leg.vix, 2)}</td>
-                        <td className={`px-4 py-3 text-right text-sm ${legPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                        {/* The LEG row's index is grey too -- the builder fills the
+                            whole Index column, not just the day-summary rows. */}
+                        <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A', backgroundColor: '#E3E3E3' }}>{indexOfFirstTrade + idx + 1}.{legIdx + 1}</td>
+                        <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>{leg.entry_date || '-'}</td>
+                        <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>{leg.entry_time || '-'}</td>
+                        <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>{leg.exit_date || '-'}</td>
+                        <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>{leg.exit_time || '-'}</td>
+                        <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>{leg.type || '-'}</td>
+                        <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>{leg.strike || '-'}</td>
+                        <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>{leg.side || '-'}</td>
+                        <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>{leg.qty || '-'}</td>
+                        <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>{formatNumber(leg.entry_price, 2)}</td>
+                        <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>{formatNumber(leg.exit_price, 2)}</td>
+                        <td className={`p-1 text-center text-[14px] font-medium border-2 ${legPnl >= 0 ? 'text-green-600' : 'text-red-600'}`} style={{ borderColor: '#D4D4D8' }}>
                           {formatNumber(legPnl, 2)}
                         </td>
                       </tr>
@@ -893,19 +1313,19 @@ const PortfolioBacktestResults = ({
                   const pnl = parseFloat(trade.pnl || 0);
                   return (
                     <tr key={`${indexOfFirstTrade + idx}-${trade.leg_number}`} className="hover:bg-gray-50">
-                      <td className="px-4 py-3 text-gray-900">{indexOfFirstTrade + idx + 1}</td>
-                      <td className="px-4 py-3 text-gray-900">{trade.entry_date || '-'}</td>
-                      <td className="px-4 py-3 text-gray-900">{trade.entry_time || '-'}</td>
-                      <td className="px-4 py-3 text-gray-900">{trade.exit_date || '-'}</td>
-                      <td className="px-4 py-3 text-gray-900">{trade.exit_time || '-'}</td>
-                      <td className="px-4 py-3 text-gray-900 uppercase">{trade.type || '-'}</td>
-                      <td className="px-4 py-3 text-right text-gray-900">{trade.strike || '-'}</td>
-                      <td className="px-4 py-3 text-gray-900">{trade.side || '-'}</td>
-                      <td className="px-4 py-3 text-right text-gray-900">{trade.qty || '-'}</td>
-                      <td className="px-4 py-3 text-right text-gray-900">{formatNumber(trade.entry_price, 2)}</td>
-                      <td className="px-4 py-3 text-right text-gray-900">{formatNumber(trade.exit_price, 2)}</td>
-                      <td className="px-4 py-3 text-right text-gray-900">{formatNumber(trade.vix, 2)}</td>
-                      <td className={`px-4 py-3 text-right font-medium ${pnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                      {/* Index column carries the header band's grey, as the builder draws it. */}
+                      <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A', backgroundColor: '#E3E3E3' }}>{indexOfFirstTrade + idx + 1}</td>
+                      <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>{trade.entry_date || '-'}</td>
+                      <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>{trade.entry_time || '-'}</td>
+                      <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>{trade.exit_date || '-'}</td>
+                      <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>{trade.exit_time || '-'}</td>
+                      <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>{trade.type || '-'}</td>
+                      <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>{trade.strike || '-'}</td>
+                      <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>{trade.side || '-'}</td>
+                      <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>{trade.qty || '-'}</td>
+                      <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>{formatNumber(trade.entry_price, 2)}</td>
+                      <td className="p-1 text-center text-[14px] font-medium border-2" style={{ borderColor: '#D4D4D8', color: '#2A2A2A' }}>{formatNumber(trade.exit_price, 2)}</td>
+                      <td className={`p-1 text-center text-[14px] font-medium border-2 ${pnl >= 0 ? 'text-green-600' : 'text-red-600'}`} style={{ borderColor: '#D4D4D8' }}>
                         {formatNumber(pnl, 2)}
                       </td>
                     </tr>
@@ -916,68 +1336,43 @@ const PortfolioBacktestResults = ({
           </table>
         </div>
 
-        {/* Pagination */}
-        <div className="flex items-center justify-center gap-2 mt-4">
-          <button 
-            onClick={() => setCurrentPage(1)}
-            disabled={currentPage === 1}
-            className="px-3 py-1 border border-gray-300 rounded text-sm hover:bg-gray-50 disabled:opacity-50"
-          >
-            «
-          </button>
-          <button 
-            onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
-            disabled={currentPage === 1}
-            className="px-3 py-1 border border-gray-300 rounded text-sm hover:bg-gray-50 disabled:opacity-50"
-          >
-            ‹
-          </button>
-          {[...Array(Math.min(5, totalPages))].map((_, i) => {
-            const pageNum = currentPage <= 3 ? i + 1 : currentPage - 2 + i;
-            if (pageNum > totalPages) return null;
-            return (
-              <button
-                key={pageNum}
-                onClick={() => setCurrentPage(pageNum)}
-                className={`px-3 py-1 border rounded text-sm ${
-                  currentPage === pageNum 
-                    ? 'bg-blue-600 text-white border-blue-600' 
-                    : 'border-gray-300 hover:bg-gray-50'
-                }`}
-              >
-                {pageNum}
-              </button>
-            );
-          })}
-          <button 
-            onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
-            disabled={currentPage === totalPages}
-            className="px-3 py-1 border border-gray-300 rounded text-sm hover:bg-gray-50 disabled:opacity-50"
-          >
-            ›
-          </button>
-          <button 
-            onClick={() => setCurrentPage(totalPages)}
-            disabled={currentPage === totalPages}
-            className="px-3 py-1 border border-gray-300 rounded text-sm hover:bg-gray-50 disabled:opacity-50"
-          >
-            »
-          </button>
-        </div>
+        {/* The shared pager -- see ReportPager.jsx. */}
+        <ReportPager page={safePage} totalPages={totalPages} onChange={setCurrentPage} />
 
-        <div className="mt-4">
-          <button className="px-4 py-2 border border-gray-300 rounded text-sm hover:bg-gray-50">
+
+        {/* Same pair, same styling as the Strategy Builder report footer:
+            outlined navy Download Report, outlined red Close Report. */}
+        <div className="mt-4 flex items-center gap-3">
+          <button
+            type="button"
+            onClick={() => { setFileName(''); setShowFileNameModal(true); }}
+            className="px-4 py-2 rounded-md border text-[13px] font-medium transition-colors"
+            style={{ borderColor: colors.settingsPanel.activeBg, color: colors.settingsPanel.activeBg, backgroundColor: '#FFFFFF' }}
+            onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = colors.settingsPanel.activeBg; e.currentTarget.style.color = '#FFFFFF'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = '#FFFFFF'; e.currentTarget.style.color = colors.settingsPanel.activeBg; }}
+          >
             Download Report
           </button>
+
+          {onClose && (
+            <button
+              type="button"
+              onClick={onClose}
+              className="px-4 py-2 rounded-md border text-[13px] font-medium text-red-600 border-red-400 bg-white hover:bg-red-600 hover:border-red-600 hover:text-white transition-colors"
+              title="Close and clear this report"
+            >
+              Close Report
+            </button>
+          )}
         </div>
       </div>
       )}
+
     </div>
   );
 };
 
-// Helper component for strategy-wise report rows
-const StatisticRow = ({ label, strategies, data, field, isCurrency = false }) => {
+const StatisticRow = ({ label, strategies, data, field, isCurrency = false, fadedColumns }) => {
   const formatValue = (value) => {
     if (value === null || value === undefined) return '-';
     const num = parseFloat(value);
@@ -990,15 +1385,18 @@ const StatisticRow = ({ label, strategies, data, field, isCurrency = false }) =>
   };
 
   return (
-    <tr className="hover:bg-gray-50">
-      <td className="px-4 py-3 text-left font-medium text-gray-700">{label}</td>
+    <tr style={{ backgroundColor: '#F8F8F8' }}>
+      <td className="px-4 py-3 text-left font-semibold text-[14px]" style={{ color: '#2A2A2A' }}>{label}</td>
       {strategies.map(strategy => {
         const value = data[strategy]?.[field] || 0;
         const numValue = parseFloat(value);
-        const colorClass = numValue >= 0 ? 'text-green-600' : 'text-red-600';
-        
+        const money = isCurrency || label.includes('Profit') || label.includes('Loss');
+        const faded = fadedColumns?.has(strategy);
+        const tone = money ? (numValue >= 0 ? '#006A2C' : '#B12020') : '#A1A1AA';
+
         return (
-          <td key={strategy} className={`px-4 py-3 text-right ${isCurrency || label.includes('Profit') || label.includes('Loss') ? colorClass : 'text-gray-900'}`}>
+          <td key={strategy} className="px-4 py-3 text-center font-semibold text-[12px]"
+              style={{ color: tone, opacity: faded ? 0.4 : 1 }}>
             {formatValue(value)}
           </td>
         );

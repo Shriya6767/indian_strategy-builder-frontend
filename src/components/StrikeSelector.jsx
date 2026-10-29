@@ -1,9 +1,18 @@
-import React, { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { ChevronDown } from 'lucide-react';
 
-const StrikeSelector = ({ value, onChange }) => {
+/**
+ * heightClass: overrides the size preset's height (the Leg Builder row pins its
+ * whole row to one height); everything else follows `size`.
+ * size: 'sm' (default) matches the h-8 square-cornered controls inside a leg
+ * card; 'md' matches the h-10 rounded controls used by the Leg Builder row and
+ * the Lazy / Sequential leg modals, so the trigger lines up with the selects
+ * and inputs beside it.
+ */
+const StrikeSelector = ({ value, onChange, size = 'sm', heightClass }) => {
   const [isOpen, setIsOpen] = useState(false);
   const containerRef = useRef(null);
+  const listRef = useRef(null);
 
   const strikeOptions = [
     'ITM-20', 'ITM-19', 'ITM-18', 'ITM-17', 'ITM-16',
@@ -40,21 +49,36 @@ const StrikeSelector = ({ value, onChange }) => {
       document.removeEventListener('mousedown', handleClickOutside);
     };
   }, [isOpen]);
+  useEffect(() => {
+    if (!isOpen) return;
+    const list = listRef.current;
+    const active = list?.querySelector('[data-active="true"]');
+    if (!list || !active) return;
+    // Rect-based so it does not depend on which ancestor is the offsetParent.
+    const delta = active.getBoundingClientRect().top - list.getBoundingClientRect().top;
+    list.scrollTop += delta - (list.clientHeight - active.offsetHeight) / 2;
+  }, [isOpen]);
 
   return (
     <div className="relative w-full" ref={containerRef}>
       {/* Trigger Button */}
       <button
         onClick={() => setIsOpen(!isOpen)}
-        className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white font-medium hover:border-gray-400 focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all w-full flex items-center justify-between"
+        className={`px-3 bg-white font-normal outline-none transition-all w-full flex items-center justify-between ${
+          heightClass
+            ? `${heightClass} text-[13px] rounded-md border border-[#e3e3e3]`
+            : size === 'md'
+              ? 'h-10 text-[14px] rounded-md border border-[#e3e3e3]'
+              : 'h-[34px] text-[12px] rounded border border-[#d4d4d4]'
+        }`}
       >
         <span>{displayValue}</span>
-        <ChevronDown size={18} className={`transition-transform ${isOpen ? 'rotate-180' : ''}`} />
+        <ChevronDown size={14} className={`transition-transform ${isOpen ? 'rotate-180' : ''}`} />
       </button>
 
       {/* Inline Dropdown */}
       {isOpen && (
-        <div className="absolute top-full left-0 right-0 mt-1 bg-white border border-gray-300 rounded-lg shadow-lg z-50 max-h-64 overflow-y-auto">
+        <div ref={listRef} className="absolute top-full left-0 right-0 mt-1 bg-white border border-gray-300 rounded-lg shadow-lg z-50 max-h-64 overflow-y-auto">
           {strikeOptions.map((option) => {
             const optionValue = option.toLowerCase().replace('-', '_');
             const isSelected = value === optionValue;
@@ -62,6 +86,7 @@ const StrikeSelector = ({ value, onChange }) => {
             return (
               <button
                 key={option}
+                data-active={isSelected ? 'true' : undefined}
                 onClick={() => handleSelect(option)}
                 className={`w-full px-4 py-2 text-left text-sm font-medium transition-colors ${
                   isSelected

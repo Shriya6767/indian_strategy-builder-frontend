@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import { createContext, useContext, useState, useEffect } from 'react';
 import logger from '../utils/logger';
 
 /**
@@ -28,14 +28,30 @@ export const StrategyProvider = ({ children }) => {
     version: null,
   });
 
+  // name -> version, in state as well as localStorage. It used to be read
+  // straight out of storage on every lookup, which left it the one thing the
+  // app persisted that no context held.
+  const [versionMap, setVersionMap] = useState({});
+
   const [isInitialized, setIsInitialized] = useState(false);
+  // True only after a save/load in THIS session — a name restored from
+  // localStorage alone keeps the header showing "Unsaved Strategy".
+  const [sessionTouched, setSessionTouched] = useState(false);
 
   /**
    * INITIALIZATION: Load data from localStorage on mount
    * This runs ONCE when the app first loads
    */
   useEffect(() => {
-    
+    // The version map comes back with everything else, so a reopened tab knows
+    // which version each saved strategy is on.
+    try {
+      const storedMap = JSON.parse(localStorage.getItem(VERSION_MAP_KEY) || '{}');
+      if (storedMap && typeof storedMap === 'object') setVersionMap(storedMap);
+    } catch (error) {
+      logger.error('[StrategyContext] Error reading version map:', error);
+    }
+
     try {
       const storedData = localStorage.getItem(STORAGE_KEY);
       
@@ -51,10 +67,10 @@ export const StrategyProvider = ({ children }) => {
       } else {
       }
     } catch (error) {
-      logger.error('❌'.repeat(50));
-      logger.error('❌ [StrategyContext] ERROR loading from localStorage:', error);
-      logger.error('❌ Error details:', error.message);
-      logger.error('❌'.repeat(50));
+      logger.error(''.repeat(50));
+      logger.error('[StrategyContext] ERROR loading from localStorage:', error);
+      logger.error('Error details:', error.message);
+      logger.error(''.repeat(50));
     } finally {
       setIsInitialized(true);
     }
@@ -73,7 +89,7 @@ export const StrategyProvider = ({ children }) => {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(strategyData));
     } catch (error) {
-      logger.error('[StrategyContext] ❌ Error syncing to localStorage:', error);
+      logger.error('[StrategyContext] Error syncing to localStorage:', error);
     }
   }, [strategyData, isInitialized]); // Runs when strategyData changes
 
@@ -86,6 +102,7 @@ export const StrategyProvider = ({ children }) => {
    * @param {number|null} version - Version number
    */
   const updateStrategyData = (strategy_id, strategy_name, version) => {
+    setSessionTouched(true);
 
     setStrategyData({
       strategy_id: strategy_id || null,
@@ -94,13 +111,15 @@ export const StrategyProvider = ({ children }) => {
     });
 
     if (strategy_name && version !== null && version !== undefined) {
-      try {
-        const versionMap = JSON.parse(localStorage.getItem(VERSION_MAP_KEY) || '{}');
-        versionMap[strategy_name] = version;
-        localStorage.setItem(VERSION_MAP_KEY, JSON.stringify(versionMap));
-      } catch (error) {
-        logger.error('[StrategyContext] ❌ Error updating version map:', error);
-      }
+      setVersionMap((previous) => {
+        const next = { ...previous, [strategy_name]: version };
+        try {
+          localStorage.setItem(VERSION_MAP_KEY, JSON.stringify(next));
+        } catch (error) {
+          logger.error('[StrategyContext] Error updating version map:', error);
+        }
+        return next;
+      });
     }
 
   };
@@ -113,14 +132,8 @@ export const StrategyProvider = ({ children }) => {
    * @returns {number|null} Version number or null if not found
    */
   const getVersionByName = (strategy_name) => {
-    try {
-      const versionMap = JSON.parse(localStorage.getItem(VERSION_MAP_KEY) || '{}');
-      const version = versionMap[strategy_name];
-      return version !== undefined ? version : null;
-    } catch (error) {
-      logger.error('[StrategyContext] ❌ Error reading version map:', error);
-      return null;
-    }
+    const version = versionMap[strategy_name];
+    return version !== undefined ? version : null;
   };
 
   /**
@@ -137,7 +150,7 @@ export const StrategyProvider = ({ children }) => {
     try {
       localStorage.removeItem(STORAGE_KEY);
     } catch (error) {
-      logger.error('[StrategyContext] ❌ Error clearing localStorage:', error);
+      logger.error('[StrategyContext] Error clearing localStorage:', error);
     }
   };
 
@@ -169,6 +182,7 @@ export const StrategyProvider = ({ children }) => {
     getFromLocalStorage,
     
     isInitialized,
+    sessionTouched,
   };
 
   return (
@@ -194,25 +208,5 @@ export const useStrategy = () => {
   
   return context;
 };
-
-/**
- * USAGE EXAMPLES:
- * 
- * 1. Wrap your app with StrategyProvider:
- *    <StrategyProvider>
- *      <App />
- *    </StrategyProvider>
- * 
- * 2. Use in any component:
- *    const { strategy_id, strategy_name, version, updateStrategyData } = useStrategy();
- * 
- * 3. Update strategy data:
- *    updateStrategyData('123', 'My Strategy', 1);
- * 
- * 4. Clear strategy data:
- *    clearStrategyData();
- * 
- * 5. Read current data:
- */
 
 export default StrategyContext;

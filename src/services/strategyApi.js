@@ -1,7 +1,7 @@
 /**
  * Strategy API Service
  * Handles all API calls related to strategy operations.
- * All requests go to the FastAPI backend at http://192.168.0.125:8000
+ * All requests go to the FastAPI backend at http://192.168.1.5:8000
  */
 
 import { API_URL } from "./api";
@@ -12,16 +12,16 @@ import logger from '../utils/logger';
  * @param {Object} requestBody - Strategy data with structure { strategy: {...}, legs: [...], version: number }
  * @returns {Promise<Object>} - API response
  */
-export const saveStrategy = async (requestBody) => {
+const postStrategy = async ({ path, method, label, successMessage }, requestBody) => {
   try {
-    logger.request('[SAVE STRATEGY] Request', { 
-      method: 'POST',
-      url: `${API_URL}/save-strategy`,
+    logger.request(`[${label}] Request`, {
+      method,
+      url: `${API_URL}/${path}`,
       body: requestBody
     });
 
-    const response = await fetch(`${API_URL}/save-strategy`, {
-      method: 'POST',
+    const response = await fetch(`${API_URL}/${path}`, {
+      method,
       headers: {
         'Content-Type': 'application/json',
         'Accept': 'application/json',
@@ -55,21 +55,21 @@ export const saveStrategy = async (requestBody) => {
       throw new Error(errorMessage);
     }
 
-    logger.response('[SAVE STRATEGY] Response', { 
+    logger.response(`[${label}] Response`, {
       status: response.status,
       data: data
     });
-    logger.success('Strategy saved successfully');
+    logger.success(successMessage);
     return {
       success: true,
       data,
       strategy_id: data.strategy_id || data.id || null,
       strategy_name: data.strategy_name || null,
       version: data.version || null,
-      message: data.message || 'Strategy saved successfully',
+      message: data.message || successMessage,
     };
   } catch (error) {
-    logger.error('[API] ✗ Save strategy failed:', error.message);
+    logger.error(`[API] ${label} failed:`, error.message);
     if (error.name === 'AbortError') {
       throw new Error('Request timeout - backend took too long to respond');
     } else if (error instanceof TypeError) {
@@ -78,6 +78,28 @@ export const saveStrategy = async (requestBody) => {
     throw error;
   }
 };
+
+/**
+ * Create / save a strategy — POST /api/save-strategy.
+ */
+export const saveStrategy = (requestBody) => postStrategy({
+  path: 'save-strategy',
+  method: 'POST',
+  label: 'SAVE STRATEGY',
+  successMessage: 'Strategy saved',
+}, requestBody);
+
+/**
+ * Update an existing strategy — PUT /api/update-strategy.
+ * Identical payload to save (strategy_name and strategy_id included); only the
+ * endpoint and method differ, so both share postStrategy above.
+ */
+export const updateStrategy = (requestBody) => postStrategy({
+  path: 'update-strategy',
+  method: 'PUT',
+  label: 'UPDATE STRATEGY',
+  successMessage: 'Strategy updated successfully',
+}, requestBody);
 
 /**
  * Build run-backtest request payload.
@@ -144,7 +166,7 @@ export const deleteStrategy = async (strategyId, strategyName) => {
       message: data.message || 'Strategy deleted successfully',
     };
   } catch (error) {
-    logger.error('[API] ✗ Delete strategy failed:', error.message);
+    logger.error('[API] Delete strategy failed:', error.message);
     if (error instanceof TypeError) {
       throw new Error(`Network error - unable to reach the server at ${API_URL}`);
     }
@@ -207,7 +229,7 @@ export const compareBacktests = async (strategyId, strategyName) => {
       message: data.message || 'Backtests compared successfully',
     };
   } catch (error) {
-    logger.error('[API] ✗ Compare backtests failed:', error.message);
+    logger.error('[API] Compare backtests failed:', error.message);
     if (error instanceof TypeError) {
       throw new Error(`Network error - unable to reach the server at ${API_URL}`);
     }
@@ -250,6 +272,10 @@ export const buildSaveStrategyPayload = (config, version = null) => {
     return '00:00:00';
   };
 
+  // "itm_3" -> "ITM-3", "otm_1" -> "OTM-1": exactly the label the Strike Type
+  // dropdown shows. The separator belongs here, NOT in strike_sign. Must stay
+  // identical to formatStrikeTypeForBackend in StrategyBuilder.jsx, which
+  // builds the run-backtest payload.
   const formatStrikeForBackend = (strikeType) => {
     if (!strikeType || strikeType === 'atm') return 'ATM';
     const lc = String(strikeType).toLowerCase();
@@ -259,17 +285,9 @@ export const buildSaveStrategyPayload = (config, version = null) => {
     }
     if (lc.startsWith('otm_')) {
       const n = parseInt(lc.replace('otm_', ''), 10);
-      return `OTM+${isNaN(n) ? 1 : n}`;
+      return `OTM-${isNaN(n) ? 1 : n}`;
     }
     return 'ATM';
-  };
-
-  const getStrikeSign = (strikeType) => {
-    if (!strikeType) return '';
-    const lc = String(strikeType).toLowerCase();
-    if (lc.includes('itm') || lc === 'ITM') return '-';
-    if (lc.includes('otm') || lc === 'OTM') return '+';
-    return '';
   };
 
   const formatTypeForBackend = (typeValue) => {
@@ -287,6 +305,39 @@ export const buildSaveStrategyPayload = (config, version = null) => {
     return result;
   };
 
+  // Simple Momentum dropdown value -> backend enum. Uppercasing alone is wrong:
+  // the option values are 'points' / 'percentage', which would go out as POINTS /
+  // PERCENTAGE instead of POINTS_UP / PERCENT_UP. Mirrors momentumModeMap in
+  // StrategyBuilder's run-backtest builder so save and backtest agree.
+  const MOMENTUM_TYPE_FOR_BACKEND = {
+    points: 'POINTS_UP',
+    points_down: 'POINTS_DOWN',
+    percentage: 'PERCENT_UP',
+    percentage_down: 'PERCENT_DOWN',
+    underlying_points_up: 'UNDERLYING_POINTS_UP',
+    underlying_points_down: 'UNDERLYING_POINTS_DOWN',
+    underlying_percentage_up: 'UNDERLYING_PERCENT_UP',
+    underlying_percentage_down: 'UNDERLYING_PERCENT_DOWN',
+    percent_up: 'PERCENT_UP',
+    percent_down: 'PERCENT_DOWN',
+  };
+
+  /*
+    POINTS_UP when nothing is set, NOT percent.
+
+    This used to answer PERCENT_DOWN for a missing mode, and legs regularly
+    have one missing: "Add Leg" builds a leg from a template that spells the
+    field `momentum_type`, while this reads `momentum_mode`. So a leg whose
+    template default says POINTS was saved -- and backtested -- as PERCENT_DOWN,
+    which is a different trade entirely. Every sibling field here already falls
+    back to points; momentum was the one that did not.
+  */
+  const formatMomentumForBackend = (mode) => {
+    if (!mode) return 'POINTS_UP';
+    const lc = String(mode).toLowerCase();
+    return MOMENTUM_TYPE_FOR_BACKEND[lc] || lc.toUpperCase();
+  };
+
   const toBoolean = (val) => {
     if (typeof val === 'boolean') return val;
     if (val && typeof val === 'object' && val.target && typeof val.target.checked === 'boolean') {
@@ -301,11 +352,19 @@ export const buildSaveStrategyPayload = (config, version = null) => {
       return null;
     }
     
-    const idMatch = String(lazyLegId).match(/lazy_leg_(\d+)/);
-    const numericId = idMatch ? parseInt(idMatch[1], 10) : null;
-    
-    const lazyLeg = allLegs.find(l => l.id === numericId || l.id === lazyLegId);
-    
+    // The reference is "lazy_leg_<id>". Matching only /(\d+)/ meant a leg whose
+    // id was non-numeric never resolved, and an unresolved lazy leg is silently
+    // dropped from the payload — so comparison is done on the raw id too.
+    const rawId = String(lazyLegId).replace(/^lazy_leg_/, '');
+    const numericId = /^\d+$/.test(rawId) ? parseInt(rawId, 10) : null;
+
+    const lazyLeg = allLegs.find(
+      (l) =>
+        (numericId !== null && l.id === numericId) ||
+        String(l.id) === rawId ||
+        l.id === lazyLegId
+    );
+
     if (!lazyLeg) {
       logger.error(`[buildSaveStrategyPayload] Lazy leg not found: ${lazyLegId} (numeric: ${numericId})`);
       return null;
@@ -321,12 +380,24 @@ export const buildSaveStrategyPayload = (config, version = null) => {
       lot_size: toNumber(lazyLeg.lots),
       position_type: (lazyLeg.position || 'buy').toUpperCase(),
       option_type: (lazyLeg.option_type || 'call').toLowerCase(),
-      expiry_type: lazyLeg.expiry || '0dte',
+      expiry_type: lazyLeg.expiry || 'weekly',
       strike_criteria: getMappedStrikeCriteria(lazyLeg.strike_criteria || 'based on points'),
-      atm_strike: (getMappedStrikeCriteria(lazyLeg.strike_criteria) === 'atm percentage') ? 'ATM' : 0,
+      // Same rules as a main leg. This used to send 0 for anything but
+      // atm-percentage, so a lazy leg's ITM/OTM strike was never saved and came
+      // back as ATM when the version was reloaded.
+      atm_strike: (() => {
+        const mappedCriteria = getMappedStrikeCriteria(lazyLeg.strike_criteria);
+        if (mappedCriteria === 'atm percentage') {
+          return 'ATM';
+        }
+        if (lazyLeg.strike_criteria === 'based on points' || lazyLeg.strike_criteria === 'based_on_points') {
+          return formatStrikeForBackend(lazyLeg.strike_type);
+        }
+        return null;
+      })(),
       strike_sign: (lazyLeg.strike_criteria === 'based on atm percent' || lazyLeg.strike_criteria === 'based_on_atm_percent')
                   ? (lazyLeg.atm_percent_direction || '')
-                  : null,
+                  : '',   // ITM/OTM: the direction is already in atm_strike
       premium_value: (lazyLeg.strike_criteria === 'closest premium' || lazyLeg.strike_criteria === 'closest_premium')
                       ? toNumber(lazyLeg.closest_premium_value)
                       : (lazyLeg.strike_criteria === 'premium range' || lazyLeg.strike_criteria === 'premium_range')
@@ -374,7 +445,7 @@ export const buildSaveStrategyPayload = (config, version = null) => {
         return toNumber(lazyLeg.reentry_tgt_count) || 0;
       })(),
       is_simple_momentum: toBoolean(lazyLeg.momentum_enabled),
-      momentum_type: lazyLeg.momentum_enabled ? (lazyLeg.momentum_mode || lazyLeg.momentum_type || 'percent_down').toUpperCase() : null,
+      momentum_type: lazyLeg.momentum_enabled ? formatMomentumForBackend(lazyLeg.momentum_mode || lazyLeg.momentum_type) : null,
       momentum_value: toNumber(lazyLeg.momentum_value) || null,
     };
     
@@ -394,14 +465,14 @@ export const buildSaveStrategyPayload = (config, version = null) => {
     return lazyLegObject;
   };
 
-  const legsArray = (config.legs || [])
-    .filter(leg => !leg.isLazyLeg && !leg.isSequentialLeg)
-    .map((leg, iterationIndex) => {
+  // One leg → one backend leg object. Shared by main legs and by the sequential
+  // leg nested under them, so both carry an identical field set.
+  const buildLegPayload = (leg) => {
     const processedLeg = {
       lot_size: toNumber(leg.lots),
       position_type: (leg.position || 'buy').toUpperCase(),
       option_type: (leg.option_type || 'call').toLowerCase(),
-      expiry_type: leg.expiry || '0dte',
+      expiry_type: leg.expiry || 'weekly',
     strike_criteria: getMappedStrikeCriteria(leg.strike_criteria),
     atm_strike: (() => {
       const mappedCriteria = getMappedStrikeCriteria(leg.strike_criteria);
@@ -415,7 +486,7 @@ export const buildSaveStrategyPayload = (config, version = null) => {
     })(),
     strike_sign: (leg.strike_criteria === 'based on atm percent' || leg.strike_criteria === 'based_on_atm_percent')
                 ? (leg.atm_percent_direction || '')
-                : getStrikeSign(leg.strike_type),
+                : '',   // ITM/OTM: the direction is already in atm_strike
     premium_value: (leg.strike_criteria === 'closest premium' || leg.strike_criteria === 'closest_premium')
                     ? toNumber(leg.closest_premium_value)
                     : (leg.strike_criteria === 'premium range' || leg.strike_criteria === 'premium_range')
@@ -463,7 +534,9 @@ export const buildSaveStrategyPayload = (config, version = null) => {
       return toNumber(leg.reentry_tgt_count) || 0;
     })(),
     is_simple_momentum: leg.momentum_enabled || false,
-    momentum_type: (leg.momentum_mode || 'percent_down').toUpperCase(),
+    // `|| leg.momentum_type` for the same reason the lazy-leg line above has
+    // it: a leg straight out of "Add Leg" carries the mode under that name.
+    momentum_type: formatMomentumForBackend(leg.momentum_mode || leg.momentum_type),
     momentum_value: toNumber(leg.momentum_value),
     is_range_breakout: leg.range_enabled || false,
     range_breakout_type: leg.range_enabled
@@ -471,114 +544,105 @@ export const buildSaveStrategyPayload = (config, version = null) => {
         ? 'Instrument'
         : 'Underlying'
       : null,
+    // End of the breakout window. BTST sends "today"/"tomorrow"; Positional
+    // sends the DTE number AS A STRING (backend stores it as text). Other
+    // strategy types have no such control, so they send null. Defaults mirror
+    // what the LegCard dropdowns show when the leg carries no value yet.
+    range_end_day: (() => {
+      if (!leg.range_enabled) return null;
+      const st = (config.strategy_type || '').toLowerCase();
+      const v = String(leg.range_end_day ?? '');
+      // Each type accepts only ITS OWN shape. Switching Positional -> BTST left
+      // a DTE number on the leg, which passed BTST's truthy check and shipped
+      // "1" where the backend expects "today".
+      if (st === 'btst') return (v === 'today' || v === 'tomorrow') ? v : 'today';
+      if (st === 'positional') return /^\d+$/.test(v) ? v : '0';
+      return null;
+    })(),
     range_end_time: leg.range_enabled ? formatTime(leg.range_time) : null,
     range_on: leg.range_enabled 
       ? (leg.range_direction || 'high').charAt(0).toUpperCase() + (leg.range_direction || 'high').slice(1).toLowerCase()
       : null,
+    };
+
+    if (leg.reentry_sl_mode?.startsWith('lazy_leg_')) {
+      const lazyLegObject = buildLazyLegObject(leg.reentry_sl_mode, config.legs || []);
+      if (lazyLegObject) {
+        processedLeg.lazy_leg = lazyLegObject;
+        processedLeg.reentry_sl_type = 'LAZY_LEG';
+        processedLeg.reentry_sl_value = 1;
+      }
+    } else if (leg.reentry_tgt_mode?.startsWith('lazy_leg_')) {
+      const lazyLegObject = buildLazyLegObject(leg.reentry_tgt_mode, config.legs || []);
+      if (lazyLegObject) {
+        processedLeg.lazy_leg = lazyLegObject;
+        processedLeg.reentry_target_type = 'LAZY_LEG';
+        processedLeg.reentry_target_value = 1;
+      }
+    }
+
+    return processedLeg;
   };
-  
-  
-  if (leg.reentry_sl_mode?.startsWith('lazy_leg_')) {
-    const lazyLegObject = buildLazyLegObject(leg.reentry_sl_mode, config.legs || []);
-    if (lazyLegObject) {
-      processedLeg.lazy_leg = lazyLegObject;
-      processedLeg.reentry_sl_type = 'LAZY_LEG';
-      processedLeg.reentry_sl_value = 1;
+
+  const mainLegs = (config.legs || []).filter(leg => !leg.isLazyLeg && !leg.isSequentialLeg);
+
+  const legsArray = mainLegs.map((leg) => {
+    const processedLeg = buildLegPayload(leg);
+
+    // Sequential strategy: the leg attached to this main leg rides along as
+    // `sequential_leg`, matching what the run-backtest payload sends.
+    if (config.strategy_type === 'sequential') {
+      const sequentialLeg = (config.legs || []).find(
+        l => l.isSequentialLeg && l.parentLegId === leg.id
+      );
+      if (sequentialLeg) {
+        processedLeg.sequential_leg = {
+          leg_name: sequentialLeg.customName || `SEQ${sequentialLeg.sequentialLegNumber}`,
+          ...buildLegPayload(sequentialLeg),
+        };
+      }
     }
-  } else if (leg.reentry_tgt_mode?.startsWith('lazy_leg_')) {
-    const lazyLegObject = buildLazyLegObject(leg.reentry_tgt_mode, config.legs || []);
-    if (lazyLegObject) {
-      processedLeg.lazy_leg = lazyLegObject;
-      processedLeg.reentry_target_type = 'LAZY_LEG';
-      processedLeg.reentry_target_value = 1;
-    }
-  }
-  
-  
-  if (config.strategy_type === 'sequential') {
-    const allLegs = config.legs || [];
-    const sequentialLeg = allLegs.find(l => l.isSequentialLeg && l.parentLegIndex === iterationIndex);
-    
-    if (sequentialLeg) {
-      const legName = sequentialLeg.customName || `SEQ#${sequentialLeg.sequentialLegNumber}`;
-      
-      
-      const sequentialLegObject = {
-        leg_name: legName,
-        lot_size: toNumber(sequentialLeg.lots),
-        position_type: (sequentialLeg.position || 'buy').toUpperCase(),
-        option_type: (sequentialLeg.option_type || 'call').toLowerCase(),
-        expiry_type: sequentialLeg.expiry || '0dte',
-        strike_criteria: getMappedStrikeCriteria(sequentialLeg.strike_criteria || 'based on points'),
-        atm_strike: (getMappedStrikeCriteria(sequentialLeg.strike_criteria) === 'atm percentage') ? 'ATM' : 0,
-        strike_sign: (sequentialLeg.strike_criteria === 'based on atm percent' || sequentialLeg.strike_criteria === 'based_on_atm_percent')
-                    ? (sequentialLeg.atm_percent_direction || '')
-                    : null,
-        premium_value: 0,
-        lower_range: toNumber(sequentialLeg.lower_range),
-        upper_range: toNumber(sequentialLeg.upper_range),
-        multiplier_percentage: (() => {
-          const inputVal = sequentialLeg.atm_percent_value;
-          const result = toNumber(inputVal);
-          return result;
-        })(),
-        is_target: toBoolean(sequentialLeg.target_enabled),
-        target_type: formatTypeForBackend(sequentialLeg.target_mode || 'points'),
-        target_value: toNumber(sequentialLeg.target_value),
-        is_stoploss: toBoolean(sequentialLeg.stop_loss_enabled),
-        stoploss_type: formatTypeForBackend(sequentialLeg.stop_loss_mode || 'points'),
-        stoploss_value: toNumber(sequentialLeg.stop_loss_value),
-        is_trail_sl: toBoolean(sequentialLeg.trail_enabled),
-        trail_sl_type: sequentialLeg.trail_enabled ? formatTypeForBackend(sequentialLeg.trail_mode || 'points') : null,
-        instrument_moves: toNumber(sequentialLeg.trail_value),
-        stoploss_moves: toNumber(sequentialLeg.trail_lock_value),
-        is_reentry_sl: toBoolean(sequentialLeg.reentry_sl_enabled),
-        reentry_sl_type: sequentialLeg.reentry_sl_enabled ? (sequentialLeg.reentry_sl_mode || 're_asap').toUpperCase() : null,
-        reentry_sl_value: sequentialLeg.reentry_sl_enabled ? toNumber(sequentialLeg.reentry_sl_count) : 0,
-        is_reentry_target: toBoolean(sequentialLeg.reentry_tgt_enabled),
-        reentry_target_type: sequentialLeg.reentry_tgt_enabled ? (sequentialLeg.reentry_tgt_mode || 're_asap').toUpperCase() : null,
-        reentry_target_value: sequentialLeg.reentry_tgt_enabled ? toNumber(sequentialLeg.reentry_tgt_count) : 0,
-        is_simple_momentum: toBoolean(sequentialLeg.momentum_enabled),
-        momentum_type: sequentialLeg.momentum_enabled ? (sequentialLeg.momentum_mode || 'percent_down').toUpperCase() : null,
-        momentum_value: toNumber(sequentialLeg.momentum_value),
-        is_range_breakout: toBoolean(sequentialLeg.range_enabled),
-        range_breakout_type: sequentialLeg.range_enabled ? (sequentialLeg.range_instrument === 'instrument' ? 'Instrument' : 'Underlying') : null,
-        range_end_time: sequentialLeg.range_enabled ? formatTime(sequentialLeg.range_time) : null,
-        range_on: sequentialLeg.range_enabled ? (sequentialLeg.range_direction || 'high').charAt(0).toUpperCase() + (sequentialLeg.range_direction || 'high').slice(1).toLowerCase() : null,
-      };
-      
-      processedLeg.sequential_leg = sequentialLegObject;
-      
-    }
-  }
-  return processedLeg;
-});
+
+    return processedLeg;
+  });
+
+  // Delay restart applies to BTST and Positional. Guarding on strategy_type
+  // here (not
+  // just the toggle) means a value left over from switching type away from
+  // BTST can never leak into the payload.
+  const isPositional = (config.strategy_type || '').toLowerCase() === 'positional';
+
+  const isDelayRestartOn =
+    ['btst', 'positional'].includes((config.strategy_type || '').toLowerCase())
+    && Boolean(config.delay_restart_enabled);
 
   const strategyObject = {
-    action: 'save',
     strategy_name: config.strategy_name || `strategy_${Date.now()}`,
-    symbol: config.symbol,
+    // Index dropdown selection (Data Selection section).
+    symbol: config.dte_filter,
     start_date: config.start_date,
     end_date: config.end_date,
-    dte_filter: (() => {
-      const strategyType = (config.strategy_type || '').toLowerCase();
-      const dteValue = config.dte_filter;
-      
-      if (strategyType === 'btst' && (dteValue === 'combined' || dteValue === 'combine_dte')) {
-        return 1;
-      }
-      
-      return dteValue;
-    })(),
     underlying_type: config.underlying_type || 'option',
     is_squareoff: config.square_off === 'complete',
     is_trail_sl_break_even: config.trail_to_be || false,
     trail_sl_break_even_type: 'POINTS',
     strategy_type: (config.strategy_type || 'intraday').toUpperCase(),
+    // Positional-only keys, omitted entirely for every other strategy type so
+    // the payload matches the shapes the backend already receives.
+    ...(isPositional ? {
+      positional_expire_on: config.positional_expiry || 'weekly',
+      positional_entry_day: toNumber(config.positional_entry_day),
+      positional_exit_day: toNumber(config.positional_exit_day),
+    } : {}),
     entry_time: formatTime(config.entry_time),
     entry_delay: 0,
     exit_time: formatTime(config.exit_time),
     exit_delay: 0,
+    // BTST only, per spec; time is null whenever the toggle is off.
+    is_delay_restart: isDelayRestartOn,
+    // Same fallback as the run-backtest builder: a missing value must not
+    // become "00:00:00", which is outside the allowed window.
+    delay_restart_time: isDelayRestartOn ? formatTime(config.delay_restart_time || '09:16') : null,
     is_strategy_sl: config.overall_stop_loss_enabled || false,
     strategy_sl_type: formatTypeForBackend(config.overall_stop_loss_mode || 'mtm'),
     strategy_sl_value: toNumber(config.overall_stop_loss_value),
@@ -592,7 +656,10 @@ export const buildSaveStrategyPayload = (config, version = null) => {
     overall_reentry_target_type: (config.overall_reentry_tgt_mode || 're_asap').toUpperCase(),
     overall_reentry_target_value: toNumber(config.overall_reentry_tgt_count),
     is_overall_trail_sl: config.lock_profit_enabled || false,
-    overall_trail_sl_type: formatTypeForBackend(config.lock_profit_mode || 'points'),
+    // Overall Trail SL's MTM option is reported to the backend as POINTS.
+    overall_trail_sl_type: String(config.lock_profit_mode || 'mtm').toLowerCase() === 'mtm'
+      ? 'POINTS'
+      : formatTypeForBackend(config.lock_profit_mode),
     overall_instrument_move: toNumber(config.lock_profit_value1),
     overall_stoploss_move: toNumber(config.lock_profit_value2),
     leg_count: legsArray.length,
@@ -633,8 +700,11 @@ export const buildSaveStrategyPayload = (config, version = null) => {
         lot_size: toNumber(lazyLeg.lots),
         position_type: (lazyLeg.position || 'buy').toUpperCase(),
         option_type: (lazyLeg.option_type || 'call').toLowerCase(),
-        expiry_type: lazyLeg.expiry || '0dte',
-        strike_criteria: lazyLeg.strike_criteria || 'based on points',
+        expiry_type: lazyLeg.expiry || 'weekly',
+        // Same mapping the other two leg builders use — without it this path
+        // sent the raw UI label ("based on premium range") while every other
+        // leg sent "premium range".
+        strike_criteria: getMappedStrikeCriteria(lazyLeg.strike_criteria || 'based on points'),
         atm_strike: 0,  // Always 0 for lazy legs as per expected format
         strike_sign: (lazyLeg.strike_criteria === 'based on atm percent' || lazyLeg.strike_criteria === 'based_on_atm_percent')
                     ? (lazyLeg.atm_percent_direction || '')
@@ -676,7 +746,7 @@ export const buildSaveStrategyPayload = (config, version = null) => {
           : null,
         reentry_target_value: toNumber(lazyLeg.reentry_tgt_count) || 0,
         is_simple_momentum: toBoolean(lazyLeg.momentum_enabled),
-        momentum_type: lazyLeg.momentum_enabled ? (lazyLeg.momentum_mode || lazyLeg.momentum_type || 'percent_down').toUpperCase() : null,
+        momentum_type: lazyLeg.momentum_enabled ? formatMomentumForBackend(lazyLeg.momentum_mode || lazyLeg.momentum_type) : null,
         momentum_value: toNumber(lazyLeg.momentum_value) || null
       };
       
@@ -730,22 +800,11 @@ export const buildSaveStrategyPayload = (config, version = null) => {
 };
 
 /**
- * Extract leg ID mapping from backend response (FLAT array structure)
- * Backend returns legs as flat array with is_lazy_leg flag, not nested structure
- * 
- * @param {Object} response - Backend response from save-strategy or get-strategy API
- * @returns {Object} - Mapping of lazy_leg_name to backend leg_id
- * 
- * Example input:
- * {
- *   "legs": [
- *     { "leg_id": 285, "is_lazy_leg": false, "leg_name": "" },
- *     { "leg_id": 286, "is_lazy_leg": true, "leg_name": "lazy1" }
- *   ]
- * }
- * 
- * Example output:
- * { "lazy1": 286 }
+ * Extract leg ID mapping from a backend response.
+ *
+ * Legs come back as a FLAT array with an `is_lazy_leg` flag, not nested.
+ * Maps each lazy leg's name to its backend leg_id:
+ *   [{ leg_id: 286, is_lazy_leg: true, leg_name: "lazy1" }] -> { lazy1: 286 }
  */
 export const extractLegIdMapping = (response) => {
   const mapping = {};
@@ -776,7 +835,7 @@ export const extractLegIdMapping = (response) => {
     
     
   } catch (error) {
-    logger.error('[extractLegIdMapping] ❌ Error extracting leg IDs:', error);
+    logger.error('[extractLegIdMapping] Error extracting leg IDs:', error);
     logger.error('[extractLegIdMapping] Error stack:', error.stack);
   }
   

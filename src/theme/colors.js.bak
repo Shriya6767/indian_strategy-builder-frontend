@@ -1,0 +1,118 @@
+/**
+ * src/theme/colors.js
+ *
+ * Centralized color values for the app's hardcoded inline colors.
+ *
+ * SCOPE: This file only covers colors that were actually found hardcoded as
+ * inline styles / template-literal CSS in the codebase, in these 7 files:
+ *   StrategyBuilder.jsx, LegCard.jsx, TimeSegmentInput.jsx, DateSegmentInput.jsx,
+ *   ToggleSwitch.jsx, Tooltip.jsx, BackgroundLoadingScreen.jsx
+ *
+ * The rest of the UI (Portfolios, PortfolioDetails, CreatePortfolioModal,
+ * MultiStrategyManager, all SavedStrategies files, Header, Toast, Breadcrumb,
+ * SkeletonLoader) is styled entirely with Tailwind utility classes
+ * (bg-white, text-gray-800, border-gray-200, etc.) and has NO hardcoded hex
+ * colors to migrate. If you want to centralize those too, that's a separate
+ * task (extending Tailwind's theme in CSS), not a JS object migration.
+ *
+ * Every value below was verified against its real usage — see the comment
+ * on each entry for exactly where/how it's used today.
+ */
+
+export const colors = {
+  // Primary brand blue. Used for: active/selected toggle buttons (buy/sell,
+  // call/put, NSE/BSE, square-off type, strategy type, range direction),
+  // section heading text + icon color, and the default "Add Leg" / lazy-leg
+  // buttons. 41 occurrences in StrategyBuilder.jsx, several in LegCard.jsx,
+  // and TimeSegmentInput.jsx's local THEME_COLOR constant.
+  primary: {
+    main: '#4682b4',
+
+    // Lighter blue used for the active-segment highlight / focus ring in
+    // DateSegmentInput.jsx (day/month/year segment selection).
+    hover: '#60a5fa',
+
+    // The two stops of the "toggle ON" gradient in ToggleSwitch.jsx
+    // (background: linear-gradient(135deg, gradientStart 0%, gradientEnd 100%)).
+    // gradientStart's RGB (38, 97, 156) is also reused directly as the glow
+    // shadow color at different opacities — see toggleSwitch.glowStrong/glowSoft.
+    gradientStart: '#26619C',
+    gradientEnd: '#2e75b5',
+  },
+
+  // Page background for the Strategy Builder page (StrategyBuilder.jsx).
+  page: {
+    background: '#FAFAFA',
+  },
+
+  // "Save Strategy" outline button in StrategyBuilder.jsx. Colors are set via
+  // onMouseEnter/onMouseLeave DOM style mutation (not React state), so these
+  // constants get referenced directly inside those handlers.
+  saveButton: {
+    enabled: '#2563eb',           // border + text color when enabled
+    disabled: '#9ca3af',          // border + text color when disabled
+    hoverBackground: '#004687',   // background on hover (enabled only)
+  },
+
+  // "Start Backtest" solid button in StrategyBuilder.jsx.
+  backtestButton: {
+    background: '#005A9C',
+    hoverBackground: '#004580',
+  },
+
+  // "Select" confirm button inside the time-picker modal in StrategyBuilder.jsx.
+  timePickerSelectButton: {
+    background: '#1565A0',
+  },
+
+  // Tooltip.jsx
+  tooltip: {
+    background: '#1f2937',
+    text: '#fff',
+    // Kept as a single combined shadow string since that's how it's used today
+    // (one boxShadow value with two stacked shadows).
+    shadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)',
+  },
+
+  // BackgroundLoadingScreen.jsx — SVG icon fill color.
+  loadingIcon: {
+    fill: '#0ea5e9',
+  },
+
+  // <select> dropdown background across StrategyBuilder.jsx. Previously the
+  // Tailwind class `bg-white`; migrated to an inline style so it can be
+  // changed from here instead of hunting through className strings.
+  dropdown: {
+    background: '#FFFFFF',
+  },
+  // Dropdowns that sit next to a ToggleSwitch, while toggle is OFF
+dropdownToggleOff: {
+  background: '#A9C9E8',   // light blue — adjust to taste
+},
+
+  // ToggleSwitch.jsx — all colors live inside a raw CSS template literal
+  // (a global <style> tag), so these get interpolated with ${colors.toggleSwitch.x}
+  // rather than used as JSX style props.
+  toggleSwitch: {
+    trackOff: '#808080',   // background when switch is OFF
+    thumb: '#FFFFFF',      // the round slider knob (both ON and OFF states)
+
+    // Neutral (black) shadows at different opacities.
+    shadowSoft: 'rgba(0, 0, 0, 0.05)',    // inset shadow, OFF state / resting
+    shadowMedium: 'rgba(0, 0, 0, 0.1)',   // inset shadow, ON state
+    shadowThumb: 'rgba(0, 0, 0, 0.2)',    // slider knob drop shadow, resting
+
+        glowStrong: 'rgba(38, 97, 156, 0.4)',
+    glowSoft: 'rgba(38, 97, 156, 0.2)',
+  },
+
+  // Dropdowns that sit next to a ToggleSwitch (Stop Loss, Trail SL, Target,
+  // Re-entry, Momentum, Range Breakout, Lock Profit type selectors, etc.)
+  // switch to this dark background + white text while their toggle is ON.
+  // Matches the browser's native dark-mode <select> popup color so the
+  // closed box and the open list look like one consistent theme.
+  dropdownActive: {
+    background: '#13619A',
+    text: '#FFFFFF',
+  },
+};
